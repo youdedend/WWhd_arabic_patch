@@ -60,6 +60,8 @@ android {
                 storePassword p.getProperty('storePassword')?.trim() ?: ''
                 keyAlias p.getProperty('keyAlias')?.trim() ?: ''
                 keyPassword p.getProperty('keyPassword')?.trim() ?: ''
+                v1SigningEnabled true
+                v2SigningEnabled true
             }
         }
     }

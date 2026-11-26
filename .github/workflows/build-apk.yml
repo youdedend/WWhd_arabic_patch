@@ -139,9 +139,9 @@ jobs:
         run: |
           apk_file=$(find android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -n 1)
           if [ -n "$apk_file" ] && [ -f "$apk_file" ]; then
-            echo "Publishing $apk_file to release v1.14..."
-            gh release upload v1.14 "$apk_file#WindWakerHD-Android-Plus-v1.14.apk" --clobber || \
-            gh release create v1.14 "$apk_file#WindWakerHD-Android-Plus-v1.14.apk" --title "v1.14 Android + Arabic" --notes-file RELEASE_NOTES.md --target "${{ github.ref_name }}"
+            cp "$apk_file" WindWakerHD-Android-Plus-v1.14.apk
+            echo "Publishing WindWakerHD-Android-Plus-v1.14.apk to release v1.14..."
+            gh release upload v1.14 WindWakerHD-Android-Plus-v1.14.apk --clobber
           else
             echo "::error::No APK found in android/app/build/outputs/apk"
             exit 1
