@@ -67,7 +67,11 @@ android {
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig (keystoreProps.exists() && signingConfigs.findByName("release")?.storeFile?.exists()) ? signingConfigs.release : signingConfigs.debug
+            if (keystoreProps.exists() && signingConfigs.findByName("release")?.storeFile?.exists()) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
             externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
         }
         debug {
