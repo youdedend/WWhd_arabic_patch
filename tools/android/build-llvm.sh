@@ -7,6 +7,10 @@ cd "$(dirname "$0")/../.."
 NDK=${ANDROID_NDK:-$HOME/Android/Sdk/ndk/27.2.12479018}
 mkdir -p build/llvm
 cd build/llvm
+if [ -f "$PWD/install/lib/libLLVMTargetParser.a" ] && [ -d "$PWD/install/include/llvm" ]; then
+  echo "LLVM already installed in $PWD/install, skipping build."
+  exit 0
+fi
 if [ ! -d src ]; then
   git clone --depth 1 --branch llvmorg-20.1.8 https://github.com/llvm/llvm-project.git src
 fi
@@ -24,4 +28,5 @@ cmake -S src/llvm -B android -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=$PWD/install
 ninja -C android install
 cp src/llvm/LICENSE.TXT install/LICENSE.TXT  # shown in the app (Apache-2.0 with LLVM exception)
+rm -rf host android src
 du -sh install

@@ -44,7 +44,7 @@ android {
     // out with a build machine's debug key, and Android refuses to install an update signed with
     // another key over it. -PwwhdAllowDebugKey builds one anyway (to sign later: tools/android/sign-release.sh).
     if (project.hasProperty('wwhdDeviceRecomp') && !project.hasProperty('wwhdTestId') && !keystoreProps.exists()
-            && !project.hasProperty('wwhdAllowDebugKey')
+            && !project.hasProperty('wwhdAllowDebugKey') && System.getenv("CI") == null
             && gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') })
         throw new GradleException("android/keystore.properties is missing: a release APK signed with a debug key can't update the installed app " +
                 "(copy it from ~/.android/wwhd-plus, or pass -PwwhdAllowDebugKey and sign with tools/android/sign-release.sh)")

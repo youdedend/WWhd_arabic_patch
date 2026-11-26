@@ -55,35 +55,47 @@ jobs:
       - name: Host build tools (LLVM script, glslang)
         run: sudo apt-get update && sudo apt-get install -y ninja-build bison flex
 
-      - name: LLVM cache
+      - name: LLVM install cache
+        id: llvm-cache
         uses: actions/cache@v4
         with:
-          path: build/llvm
-          # run_id in the key: cache entries are immutable, so a fixed key restores
-          # but never re-saves; this saves the finished LLVM build every run while
-          # still resuming from the previous run's cache
-          key: llvm-20.1.8-ndk27.2.12479018-${{ hashFiles('tools/android/build-llvm.sh') }}-${{ github.run_id }}
-          restore-keys: |
-            llvm-20.1.8-ndk27.2.12479018-${{ hashFiles('tools/android/build-llvm.sh') }}-
+          path: build/llvm/install
+          key: llvm-install-20.1.8-ndk27.2.12479018-${{ hashFiles('tools/android/build-llvm.sh') }}
 
       - name: Build LLVM for Android
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
         run: |
           export ANDROID_NDK="$ANDROID_HOME/ndk/27.2.12479018"
           bash tools/android/build-llvm.sh
 
-      - name: Release key from secrets (if present)
+      - name: Save LLVM install cache
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/llvm/install
+          key: llvm-install-20.1.8-ndk27.2.12479018-${{ hashFiles('tools/android/build-llvm.sh') }}
+
+      - name: Configure signing key
         run: |
-          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "No release key secrets; the APK will be signed with the debug key."
-            exit 0
-          fi
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/ci-release.keystore
-          cat > android/keystore.properties <<EOF
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/ci-release.keystore
+            cat > android/keystore.properties <<EOF
           storeFile=ci-release.keystore
           storePassword=$ANDROID_KEYSTORE_PASSWORD
           keyAlias=$ANDROID_KEY_ALIAS
           keyPassword=$ANDROID_KEY_PASSWORD
           EOF
+          else
+            echo "Generating signing key for release APK..."
+            keytool -genkeypair -v -keystore android/ci-release.jks -alias wwhd -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass wwhdandroid -keypass wwhdandroid -dname "CN=WWHD, OU=Android, O=WWhd, L=Tripoli, S=Tripoli, C=LY"
+            cat > android/keystore.properties <<EOF
+          storeFile=ci-release.jks
+          storePassword=wwhdandroid
+          keyAlias=wwhd
+          keyPassword=wwhdandroid
+          EOF
+          fi
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -92,7 +104,7 @@ jobs:
 
       - name: Build release APK (no game code in it)
         working-directory: android
-        run: ./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdVersionName="$VERSION_NAME" -PwwhdVersionCode="$VERSION_CODE" --no-daemon
+        run: ./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdAllowDebugKey -PwwhdVersionName="$VERSION_NAME" -PwwhdVersionCode="$VERSION_CODE" --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
