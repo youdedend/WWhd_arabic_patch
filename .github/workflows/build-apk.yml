@@ -78,23 +78,23 @@ jobs:
       - name: Configure signing key
         run: |
           if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/ci-release.keystore
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/ci-release.keystore
             cat > android/keystore.properties <<EOF
-          storeFile=ci-release.keystore
-          storePassword=$ANDROID_KEYSTORE_PASSWORD
-          keyAlias=$ANDROID_KEY_ALIAS
-          keyPassword=$ANDROID_KEY_PASSWORD
-          EOF
+storeFile=ci-release.keystore
+storePassword=$ANDROID_KEYSTORE_PASSWORD
+keyAlias=$ANDROID_KEY_ALIAS
+keyPassword=$ANDROID_KEY_PASSWORD
+EOF
           else
             echo "Generating signing key for release APK..."
-            keytool -genkeypair -v -keystore android/ci-release.jks -alias wwhd -keyalg RSA -keysize 2048 -validity 10000 \
+            keytool -genkeypair -v -keystore android/app/ci-release.jks -alias wwhd -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass wwhdandroid -keypass wwhdandroid -dname "CN=WWHD, OU=Android, O=WWhd, L=Tripoli, S=Tripoli, C=LY"
             cat > android/keystore.properties <<EOF
-          storeFile=ci-release.jks
-          storePassword=wwhdandroid
-          keyAlias=wwhd
-          keyPassword=wwhdandroid
-          EOF
+storeFile=ci-release.jks
+storePassword=wwhdandroid
+keyAlias=wwhd
+keyPassword=wwhdandroid
+EOF
           fi
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -113,6 +113,11 @@ jobs:
             exit 1
           }
 
+      - name: Locate APK
+        if: always()
+        run: |
+          find android -name "*.apk" -ls || true
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -124,7 +129,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wwhd-${{ env.VERSION_NAME }}-apk
-          path: android/app/build/outputs/apk/release/*.apk
+          path: android/app/build/outputs/apk/**/*.apk
 
       - name: Upload native library (crash symbolication)
         uses: actions/upload-artifact@v4
@@ -138,9 +143,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          apk_file=$(ls android/app/build/outputs/apk/release/*.apk 2>/dev/null | head -n 1)
+          apk_file=$(find android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -n 1)
           if [ -n "$apk_file" ] && [ -f "$apk_file" ]; then
             echo "Publishing $apk_file to release v1.14..."
             gh release upload v1.14 "$apk_file#WindWakerHD-Android-Plus-v1.14.apk" --clobber || \
             gh release create v1.14 "$apk_file#WindWakerHD-Android-Plus-v1.14.apk" --title "v1.14 Android + Arabic" --notes-file RELEASE_NOTES.md --target "${{ github.ref_name }}"
+          else
+            echo "::error::No APK found in android/app/build/outputs/apk"
+            exit 1
           fi

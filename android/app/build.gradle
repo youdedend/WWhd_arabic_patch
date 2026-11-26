@@ -53,10 +53,13 @@ android {
             release {
                 def p = new Properties()
                 keystoreProps.withInputStream { p.load(it) }
-                storeFile file(p.getProperty('storeFile'))
-                storePassword p.getProperty('storePassword')
-                keyAlias p.getProperty('keyAlias')
-                keyPassword p.getProperty('keyPassword')
+                def sf = p.getProperty('storeFile')?.trim() ?: ''
+                def kFile = file(sf)
+                if (!kFile.exists()) kFile = rootProject.file(sf)
+                storeFile kFile
+                storePassword p.getProperty('storePassword')?.trim() ?: ''
+                keyAlias p.getProperty('keyAlias')?.trim() ?: ''
+                keyPassword p.getProperty('keyPassword')?.trim() ?: ''
             }
         }
     }
@@ -64,7 +67,7 @@ android {
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig keystoreProps.exists() ? signingConfigs.release : signingConfigs.debug
+            signingConfig (keystoreProps.exists() && signingConfigs.findByName("release")?.storeFile?.exists()) ? signingConfigs.release : signingConfigs.debug
             externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
         }
         debug {
