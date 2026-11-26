@@ -79,22 +79,13 @@ jobs:
         run: |
           if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
             echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/ci-release.keystore
-            cat > android/keystore.properties <<EOF
-storeFile=ci-release.keystore
-storePassword=$ANDROID_KEYSTORE_PASSWORD
-keyAlias=$ANDROID_KEY_ALIAS
-keyPassword=$ANDROID_KEY_PASSWORD
-EOF
+            printf "storeFile=ci-release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n" \
+              "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" > android/keystore.properties
           else
             echo "Generating signing key for release APK..."
             keytool -genkeypair -v -keystore android/app/ci-release.jks -alias wwhd -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass wwhdandroid -keypass wwhdandroid -dname "CN=WWHD, OU=Android, O=WWhd, L=Tripoli, S=Tripoli, C=LY"
-            cat > android/keystore.properties <<EOF
-storeFile=ci-release.jks
-storePassword=wwhdandroid
-keyAlias=wwhd
-keyPassword=wwhdandroid
-EOF
+            printf "storeFile=ci-release.jks\nstorePassword=wwhdandroid\nkeyAlias=wwhd\nkeyPassword=wwhdandroid\n" > android/keystore.properties
           fi
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
