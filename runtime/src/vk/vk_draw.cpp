@@ -1,24 +1,28 @@
+#include <bitset>
 #include <chrono>
 extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relevant register changes
-extern "C" uint64_t g_draw_state_gen;    // gx2_core.cpp: bumped by any non-data register change (draw fast path)
+extern "C" uint64_t g_draw_state_gen;    // gx2_core.cpp: bumped by any non-data register change
 // Draw calls on Vulkan: shader translation (Cemu decompiler, GLSL -> SPIR-V), pipelines, resource
 // binding and primitive submission. Follows gfx/metal_draw.mm; binding conventions are those of
 // the Vulkan GLSL the decompiler emits (one descriptor set per stage, as in Cemu's Vulkan renderer).
+#include "area_sample.h"
+#include "hud_coverage.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteCachedFBO.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
-#include "gfx/area_sample.h"
 #include "gx2/gx2.h"
 #include "gx2/gx2_cmd.h"
 #include "platform.h"
 #include "runtime.h"
 #include "util/helpers/StringBuf.h"
 #include "vk.h"
-#include "vk_record.h"
 #include "../mem_writes.h"
+#include "flat_table.h"
+#include "vertex_cpu_decode.h"
+#include "vertex_cpu_policy.h"
 
 #include <climits>
 #include <condition_variable>
@@ -27,7 +31,11 @@ extern "C" uint64_t g_draw_state_gen;    // gx2_core.cpp: bumped by any non-data
 #include <deque>
 #include <set>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <thread>
+#include <unordered_set>
+#include <dirent.h>
+#include <algorithm>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -111,7 +119,7 @@ static uint64_t g_fast_draws, g_slow_draws;  // draws through the fast path (sta
 // drawn many times). The comparison reads cached upload memory, much cheaper than another copy.
 struct SubmissionCopies {
     struct Copy { Upload u; uint32_t gen; };
-    std::unordered_map<uint64_t, Copy> map;
+    FlatTable<Copy> map;
     uint64_t serial = ~0ull;
 };
 static Upload copy_deduped(SubmissionCopies& c, const void* src, uint32_t addr, uint32_t size, VkDeviceSize align,
@@ -123,10 +131,10 @@ static Upload copy_deduped(SubmissionCopies& c, const void* src, uint32_t addr, 
     }
     uint64_t key = (uint64_t)addr << 32 | size;
     if (R.uploadCached) {
-        auto it = c.map.find(key);
-        if (it != c.map.end() && memcmp(it->second.u.ptr, src, size) == 0) {
+        SubmissionCopies::Copy* it = c.map.find(key);
+        if (it && memcmp(it->u.ptr, src, size) == 0) {
             reused += size;
-            return it->second.u;
+            return it->u;
         }
     }
     Upload u = upload_alloc(size, align);
@@ -149,19 +157,21 @@ static Upload copy_tracked(SubmissionCopies& c, uint32_t addr, uint32_t size, Vk
     }
     const uint8_t* src = mem::ptr(addr);
     uint64_t key = (uint64_t)addr << 32 | size;
-    auto it = c.map.find(key);
-    if (it != c.map.end() && memw::unchanged_since(addr, size, it->second.gen)) {
-        bool verify = ((addr >> 6) + R.frame) % 16 == 0;
-        if (!verify || memcmp(it->second.u.ptr, src, size) == 0) {
+    SubmissionCopies::Copy* it = c.map.find(key);
+    if (it && memw::unchanged_since(addr, size, it->gen)) {
+        // the check reads the copy back: only from cached upload memory (uncached reads are ~100x
+        // slower; original project 3563e7f)
+        bool verify = R.uploadCached && ((addr >> 6) + R.frame) % 16 == 0;
+        if (!verify || memcmp(it->u.ptr, src, size) == 0) {
             reused += size;
-            return it->second.u;
+            return it->u;
         }
         g_stale_reuses++;
         static int logged = 0;
         if (logged < 40) {
             logged++;
             uint32_t at = 0;
-            while (at < size && ((const uint8_t*)it->second.u.ptr)[at] == src[at]) at++;
+            while (at < size && ((const uint8_t*)it->u.ptr)[at] == src[at]) at++;
             LOG("[gfx] write tracking: %s %08X+%X outdated (first difference at +%X, frame %llu)", &copied == &g_bytes_ubo ? "uniform block" : "vertices",
                 addr, size, at, (unsigned long long)R.frame);
         }
@@ -189,18 +199,46 @@ static uint64_t program_sample(const uint8_t* p, uint32_t size) {
     h = hash_bytes(p + (size / 2 & ~7u), 64, h);
     return hash_bytes(p + size - 64, 64, h);
 }
+// The game uses ~1600 programs a frame: revalidating each through the map every frame cost ~7% of
+// the render thread (lookups that miss the CPU caches). A hash stays valid here while the game hasn't
+// written the program's pages since (mem_writes.h, as vertex buffers); each program still goes
+// through the map's check on one frame in 16 (spread by address), counting what the tracking missed.
+struct ProgramHot { uint32_t addr = 0, size = 0, gen = 0; uint64_t frame = ~0ull, hash = 0; };
+static ProgramHot g_program_hot[4096];
+// two slots per address (~1600 programs a frame collide often in one): its own, else the less recently used
+static ProgramHot& program_hot(uint32_t addr) {
+    ProgramHot* p = &g_program_hot[((addr >> 8) * 0x9E3779B1u >> 20) & ~1u];
+    if (p[0].addr == addr) return p[0];
+    if (p[1].addr == addr) return p[1];
+    return p[0].frame + 1 < p[1].frame + 1 ? p[0] : p[1];  // (never used: ~0 + 1 = 0)
+}
+static uint64_t g_program_map_lookups = 0, g_program_lookups = 0, g_program_stale = 0;
 static uint64_t program_hash(uint32_t addr, uint32_t size) {
-    auto& e = g_program_hashes[addr];
-    if (e.size == size && e.frame == R.frame) return e.hash;
-    const uint8_t* p = (const uint8_t*)mem::ptr(addr);
-    uint64_t sample = program_sample(p, size);
-    if (e.size != size || sample != e.sample || R.frame - e.fullFrame >= 32) {
-        e.size = size;
-        e.hash = hash_bytes(p, size);
-        e.sample = sample;
-        e.fullFrame = R.frame;
+    ProgramHot& hot = program_hot(addr);
+    g_program_lookups++;
+    const bool same = hot.addr == addr && hot.size == size;
+    if (same && hot.frame == R.frame) return hot.hash;
+    const bool verify = ((addr >> 8) + R.frame) % 16 == 0;
+    if (same && g_track_writes && !verify && memw::unchanged_since(addr, size, hot.gen)) {
+        hot.frame = R.frame;
+        return hot.hash;
     }
-    e.frame = R.frame;
+    g_program_map_lookups++;
+    const uint32_t gen = memw::now();  // before reading: a write during it makes the next use check again
+    auto& e = g_program_hashes[addr];
+    if (!(e.size == size && e.frame == R.frame)) {
+        const uint8_t* p = (const uint8_t*)mem::ptr(addr);
+        uint64_t sample = program_sample(p, size);
+        if (e.size != size || sample != e.sample || R.frame - e.fullFrame >= 32) {
+            e.size = size;
+            e.hash = hash_bytes(p, size);
+            e.sample = sample;
+            e.fullFrame = R.frame;
+        }
+        e.frame = R.frame;
+    }
+    if (same && e.hash != hot.hash && memw::unchanged_since(addr, size, hot.gen)) g_program_stale++;
+    hot = {addr, size, gen, R.frame, e.hash};
     return e.hash;
 }
 
@@ -224,6 +262,7 @@ public:
         static std::once_flag once;
         std::call_once(once, [this] {
             unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 4u);
+            if (const char* e = getenv("WWHD_COMPILE_THREADS")) n = std::clamp(atoi(e), 1, 8);  // debug
             for (unsigned i = 0; i < n; i++)
                 std::thread([this] {
                     platform::set_thread_name("shader compile");
@@ -255,22 +294,55 @@ Workers g_workers;
 // ---------------------------------------------------------------- fetch shaders
 static std::unordered_map<uint64_t, LatteFetchShader*> g_fetch;
 
+// the previous draw's fetch shader (draws in a row mostly share it): within a frame, for the same
+// program address, size word and strides (the cache replay's scratch programs reset it)
+struct FetchLast {
+    uint64_t frame = ~0ull, key = 0;
+    uint32_t prog = 0, sizeWord = 0, strides[16] = {};
+    LatteFetchShader* fs = nullptr;
+};
+static FetchLast g_fetch_last;
+
+// a save state was loaded: the memory at every program address may hold another program now, and
+// the write tracking the hot entries rely on knows nothing of it (program_hash: hashed afresh)
+void ss_reset_programs() {
+    g_program_hashes.clear();
+    for (auto& h : g_program_hot) h = ProgramHot{};
+    g_fetch_last.frame = ~0ull;
+}
+
 static LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut) {
     uint32_t prog = regs[mmSQ_PGM_START_FS] << 8;
     if (!prog) return nullptr;
+    uint32_t strides[16];
+    for (uint32_t b = 0; b < 16; b++) strides[b] = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + b * 7 + 2] >> 11) & 0xFFFF;
+    FetchLast& L = g_fetch_last;
+    if (L.frame == R.frame && L.prog == prog && L.sizeWord == regs[mmSQ_PGM_START_FS + 1] && !memcmp(L.strides, strides, sizeof strides)) {
+        *keyOut = L.key;
+        return L.fs;
+    }
     // either our compact encoding (from GX2InitFetchShaderEx) or real fetch shader microcode shipped with the game
     bool ours = ld32(prog) == 0x57574653;
     uint32_t size = ours ? 16 + ld32(prog + 4) * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
     if (size > 0x1000) return nullptr;
     uint64_t h = program_hash(prog, size);
     // strides are part of the pipeline's vertex input state
-    for (uint32_t b = 0; b < 16; b++) h = (h ^ ((regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + b * 7 + 2] >> 11) & 0xFFFF)) * 1099511628211ull;
+    for (uint32_t b = 0; b < 16; b++) h = (h ^ strides[b]) * 1099511628211ull;
     *keyOut = h;
     auto it = g_fetch.find(h);
-    if (it != g_fetch.end()) return it->second;
-    LatteFetchShader* fs = ours ? gx2::build_fetch_shader(prog)
-                                : LatteShaderRecompiler_createFetchShader(h, (uint32*)regs, (uint32*)mem::ptr(prog), size);
-    g_fetch[h] = fs;
+    LatteFetchShader* fs;
+    if (it != g_fetch.end()) {
+        fs = it->second;
+    } else {
+        fs = ours ? gx2::build_fetch_shader(prog) : LatteShaderRecompiler_createFetchShader(h, (uint32*)regs, (uint32*)mem::ptr(prog), size);
+        g_fetch[h] = fs;
+    }
+    L.frame = R.frame;
+    L.key = h;
+    L.prog = prog;
+    L.sizeWord = regs[mmSQ_PGM_START_FS + 1];
+    memcpy(L.strides, strides, sizeof strides);
+    L.fs = fs;
     return fs;
 }
 
@@ -283,13 +355,17 @@ enum CompileState { CS_PENDING, CS_READY, CS_FAILED, CS_DEFERRED };  // deferred
 // feeds and vice versa), so one program has many keys but few distinct translations.
 struct Module {
     VkShaderModule module = VK_NULL_HANDLE;   // valid once state == CS_READY
-    std::atomic<int> state{CS_PENDING};
+    std::atomic<int> state{CS_PENDING};       // CS_DEFERRED: from the cache replay, compiled later (start_module)
+    std::string pending;                      // ... with its source (the only copy kept)
+    uint64_t hash = 0, key = 0;
+    bool vertex = false;
 };
 
 struct Shader {
     uint64_t key = 0;
     bool vertex = false;
     LatteDecompilerShader* dec = nullptr;
+    uint32_t areaUnits = 0;                   // pixel shader units read area-sampled (area_sample.h)
     Module* mod = nullptr;                    // set when compiling is requested
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -299,12 +375,29 @@ struct Shader {
     uint32_t varsRange = 0;                       // size of the uniform-variable block
     uint32_t blockRange[LATTE_NUM_MAX_UNIFORM_BUFFERS] = {};  // size bound for each uniform block
     std::atomic<int> state{CS_PENDING};       // translation: CS_FAILED, CS_DEFERRED, else see mod
+    uint64_t canon = 0;                       // its translation's identity (source and layout; g_dec_shared)
 };
 // compile state of a shader (translation failure, or its module's compile)
 static const std::atomic<int>& shader_state(const Shader* s) { return s->mod ? s->mod->state : s->state; }
 static std::unordered_map<uint64_t, Module*> g_modules;  // by hash of the translated source; render thread
 static size_t g_module_cache_hits;
 static std::unordered_map<uint64_t, Shader*> g_shaders;
+static size_t g_shaders_reused;  // made from a translation already done (shaderkeys)
+// The shader cache fills g_shaders with ~200k keys: a lookup there misses the CPU caches two or three
+// times (~8% of the render thread with ~2000 lookups a frame). The frame's keys are found here
+// first, one cache line each. Shaders are never freed, so an entry stays valid.
+// Two slots per key: its own, else the one not used last (alternating).
+struct ShaderHot { uint64_t key = 0; Shader* s = nullptr; };
+static ShaderHot g_shader_hot[4096];
+static uint8_t g_shader_hot_last[2048];  // per pair: the slot used last
+static uint64_t g_shader_lookups = 0, g_shader_map_lookups = 0;
+static ShaderHot& shader_hot(uint64_t key) {
+    uint32_t set = key >> 53;
+    ShaderHot* p = &g_shader_hot[set * 2];
+    uint32_t i = p[0].s && p[0].key == key ? 0 : p[1].s && p[1].key == key ? 1 : g_shader_hot_last[set] ^ 1;
+    g_shader_hot_last[set] = i;
+    return p[i];
+}
 // compiles (shaders and pipelines) started and not finished yet; background work holds back while it's high
 static std::atomic<int> g_compiles_in_flight{0};
 static std::atomic<size_t> g_pipelines_created{0};
@@ -324,43 +417,134 @@ static void report_compile_error(const std::string& src, uint64_t key, const std
     }
 }
 
-// ---- SPIR-V cache on disk (spirv.bin next to shaders.bin): translations seen in earlier sessions
-// skip glslang. Records: uint64 source hash, uint32 word count, words.
+// ---- SPIR-V cache on disk (spirv3.bin next to shaders.bin): translations seen in earlier sessions
+// skip glslang. Records: uint64 source hash, uint32 word count, words. The file only grows: when
+// every translation changes (strictMul), a new name starts it over and the old file is deleted.
+// Only where each module is kept in memory (the file reached 68 MB, all of it was in RAM): a
+// module's words are read when it is compiled.
 static std::mutex g_spv_mutex;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> g_spv_disk;
+struct SpvAt { long offset; uint32_t words; };
+static std::unordered_map<uint64_t, SpvAt> g_spv_disk;
 static FILE* g_spv_out = nullptr;
+static FILE* g_spv_in = nullptr;
 static size_t g_spv_disk_hits;
 
+static void compile_journal_open(const std::string& dir);
 static void spirv_cache_open(const std::string& dir) {
-    std::string path = dir + "/spirv.bin";
+    compile_journal_open(dir);
+    remove((dir + "/spirv.bin").c_str());   // translations before strictMul
+    remove((dir + "/spirv2.bin").c_str());  // ... before the finite pixel colours (finiteColorOutputs)
+    std::string path = dir + "/spirv3.bin";
+    long end = 0;
     if (FILE* f = fopen(path.c_str(), "rb")) {
         uint64_t h;
         uint32_t n;
         while (fread(&h, 8, 1, f) == 1 && fread(&n, 4, 1, f) == 1 && n < (1u << 24)) {
-            std::vector<uint32_t> w(n);
-            if (fread(w.data(), 4, n, f) != n) break;
-            g_spv_disk[h] = std::move(w);
+            long at = ftell(f);
+            if (fseek(f, (long)n * 4, SEEK_CUR) != 0) break;
+            g_spv_disk[h] = {at, n};
+            end = ftell(f);
         }
         fclose(f);
+        // a record cut short (the app ended while writing): appended records must follow whole ones
+        if (truncate(path.c_str(), end) != 0) end = -1;
     }
-    g_spv_out = fopen(path.c_str(), "ab");
+    g_spv_out = end >= 0 ? fopen(path.c_str(), "ab") : nullptr;
+    g_spv_in = fopen(path.c_str(), "rb");
     if (!g_spv_disk.empty()) LOG("[gfx] SPIR-V cache: %zu modules from %s", g_spv_disk.size(), path.c_str());
 }
 
+
+// ---------------------------------------------------------------- compile journal
+// A shader or pipeline whose compile crashes the process (the GPU driver's compiler, glslang) is
+// recorded in the shader cache as it is first used, and every later start compiled it again ahead
+// of the game (the cache replay at the loading screen, the background compiles at the title): the
+// game could not be started any more (reported after entering Beedle's shop ship from the boat).
+// Each compiling thread notes what it compiles in compiling.bin (one 16-byte slot per thread); the
+// crash handler marks the slot of a thread that crashes while compiling; the next start adds those
+// to compile_failed.bin, and what is listed there is never compiled again (its draws are left out).
+struct CjEntry { uint32_t type, crashed; uint64_t id; };
+static int g_cj_fd = -1;
+static std::atomic<int> g_cj_next{0};
+static thread_local int t_cj_slot = -1;
+static thread_local CjEntry t_cj{};
+static std::unordered_set<uint64_t> g_cj_bad;
+enum : uint32_t { kCjModule = 1, kCjPipeline = 2, kCjTranslation = 3 };
+static uint64_t cj_key(uint32_t type, uint64_t id) { return id ^ (uint64_t)type * 0x9E3779B97F4A7C15ull; }
+
+static void compile_journal_open(const std::string& dir) {
+    const std::string cur = dir + "/compiling.bin", failed = dir + "/compile_failed.bin";
+    if (FILE* f = fopen(cur.c_str(), "rb")) {
+        CjEntry e;
+        FILE* out = nullptr;
+        while (fread(&e, sizeof e, 1, f) == 1) {
+            if (!e.crashed || !e.type) continue;
+            if (!out) out = fopen(failed.c_str(), "ab");
+            if (out) fwrite(&e, sizeof e, 1, out);
+            LOG("[gfx] the last run crashed while compiling %s %016llx: it is left out from now on",
+                e.type == kCjModule ? "shader" : e.type == kCjTranslation ? "shader translation" : "pipeline", (unsigned long long)e.id);
+        }
+        if (out) fclose(out);
+        fclose(f);
+    }
+    if (FILE* f = fopen(failed.c_str(), "rb")) {
+        CjEntry e;
+        while (fread(&e, sizeof e, 1, f) == 1) g_cj_bad.insert(cj_key(e.type, e.id));
+        fclose(f);
+    }
+    if (!g_cj_bad.empty()) LOG("[gfx] %zu shaders / pipelines left out (they crashed while compiling)", g_cj_bad.size());
+    g_cj_fd = open(cur.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+}
+static bool compile_journal_bad(uint32_t type, uint64_t id) { return !g_cj_bad.empty() && g_cj_bad.count(cj_key(type, id)); }
+static void compile_journal_begin(uint32_t type, uint64_t id) {
+    if (g_cj_fd < 0) return;
+    if (t_cj_slot < 0) t_cj_slot = g_cj_next.fetch_add(1);
+    if (t_cj_slot >= 256) return;
+    t_cj = {type, 0, id};
+    (void)!pwrite(g_cj_fd, &t_cj, sizeof t_cj, (off_t)t_cj_slot * sizeof t_cj);
+}
+static void compile_journal_end() {
+    if (g_cj_fd < 0 || t_cj_slot < 0 || t_cj_slot >= 256 || !t_cj.type) return;
+    t_cj = {};
+    (void)!pwrite(g_cj_fd, &t_cj, sizeof t_cj, (off_t)t_cj_slot * sizeof t_cj);
+}
+}  // namespace gfx
+// the crash handler (main.cpp): this thread was compiling -> its slot marked (async-signal-safe)
+extern "C" void wwhd_compile_journal_on_crash() {
+    using namespace gfx;
+    if (g_cj_fd < 0 || t_cj_slot < 0 || t_cj_slot >= 256 || !t_cj.type) return;
+    CjEntry e = t_cj;
+    e.crashed = 1;
+    (void)!pwrite(g_cj_fd, &e, sizeof e, (off_t)t_cj_slot * sizeof e);
+}
+namespace gfx {
+
 static void compile_now(Module* m, uint64_t hash, uint64_t key, bool vertex, const std::string& src) {
     double t0 = now_ms();
+    if (compile_journal_bad(kCjModule, hash)) {
+        m->state.store(CS_FAILED, std::memory_order_release);
+        compile_done();
+        return;
+    }
+    m->hash = hash;  // (its SPIR-V on disk: the HUD coverage variant, hud_coverage.h)
     std::vector<uint32_t> spirv;
     {
         std::lock_guard<std::mutex> lk(g_spv_mutex);
         auto it = g_spv_disk.find(hash);
-        if (it != g_spv_disk.end()) {
-            spirv = it->second;
-            g_spv_disk_hits++;
+        if (it != g_spv_disk.end() && g_spv_in) {
+            spirv.resize(it->second.words);
+            if (fseek(g_spv_in, it->second.offset, SEEK_SET) == 0 && fread(spirv.data(), 4, spirv.size(), g_spv_in) == spirv.size())
+                g_spv_disk_hits++;
+            else
+                spirv.clear();
         }
     }
     if (spirv.empty()) {
         std::string log;
-        if (!compile_glsl(src.c_str(), vertex, spirv, log)) {
+        compile_journal_begin(kCjModule, hash);
+        const bool compiled = compile_glsl(src.c_str(), vertex, spirv, log);
+        compile_journal_end();
+        if (!compiled) {
             report_compile_error(src, key, log);
             m->state.store(CS_FAILED, std::memory_order_release);
             compile_done();
@@ -371,14 +555,18 @@ static void compile_now(Module* m, uint64_t hash, uint64_t key, bool vertex, con
             uint32_t n = (uint32_t)spirv.size();
             fwrite(&hash, 8, 1, g_spv_out);
             fwrite(&n, 4, 1, g_spv_out);
+            long at = ftell(g_spv_out);
             fwrite(spirv.data(), 4, n, g_spv_out);
-            fflush(g_spv_out);
+            if (fflush(g_spv_out) == 0 && at > 0) g_spv_disk[hash] = {at, n};
         }
     }
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
-    if (vkCreateShaderModule(R.device, &ci, nullptr, &m->module) != VK_SUCCESS) {
+    compile_journal_begin(kCjModule, hash);
+    const VkResult made = vkCreateShaderModule(R.device, &ci, nullptr, &m->module);
+    compile_journal_end();
+    if (made != VK_SUCCESS) {
         LOG("[gfx] shader %016llx: vkCreateShaderModule failed", (unsigned long long)key);
         m->state.store(CS_FAILED, std::memory_order_release);
         compile_done();
@@ -389,35 +577,202 @@ static void compile_now(Module* m, uint64_t hash, uint64_t key, bool vertex, con
     compile_done();
 }
 
-// attach the shader to the module for its translation, compiling that module if it is new
-static void compile_shader(Shader* sh) {
+// The translation's source is only needed until the shader has its module (hash, module lookup, the
+// compile's own copy): freed then. The cache replay translates tens of thousands of variants sharing
+// ~1000 modules, and each kept its tens of KB of GLSL: about 2 GB of native heap on a Mi 9, which
+// Android ended for low memory (in Dragon Roost, and after save state loads).
+static void free_source(Shader* sh) {
+    delete sh->dec->strBuf_shaderSource;
+    sh->dec->strBuf_shaderSource = nullptr;
+}
+
+static std::vector<Module*> g_deferred_modules;  // the cache replay's new modules, compiled later
+static void compile_module(Module* m, uint64_t hash, uint64_t key, bool vertex, std::string src);
+
+// a deferred module's compile, now (first use, or gradually in the background)
+static void start_module(Module* m) {
+    if (m->state != CS_DEFERRED) return;
+    m->state = CS_PENDING;
+    compile_module(m, m->hash, m->key, m->vertex, std::move(m->pending));
+    m->pending = std::string();
+}
+
+// What the renderer reads from a translation besides its source (bindings, uniform layout, texture
+// units), hashed: shaders with the same source and this share one translation object.
+static uint64_t dec_fingerprint(const LatteDecompilerShader* d) {
+    uint64_t h = hash_bytes(&d->resourceMapping, sizeof d->resourceMapping, 0x4445);
+    h = hash_bytes(d->textureUsesDepthCompare, sizeof d->textureUsesDepthCompare, h);
+    h = hash_bytes(d->textureUnitSamplerAssignment, sizeof d->textureUnitSamplerAssignment, h);
+    h = hash_bytes(d->textureUnitDim, sizeof d->textureUnitDim, h);
+    const auto& u = d->uniform;
+    const int32_t scalars[] = {(int32_t)d->outputParameterMask, u.loc_remapped, u.loc_uniformRegister, u.count_uniformRegister,
+                               u.loc_windowSpaceToClipSpaceTransform, u.loc_alphaTestRef, u.loc_pointSize, u.loc_fragCoordScale,
+                               u.loc_verticesPerInstance, (int32_t)u.uniformRangeSize, (int32_t)d->textureUnitMask2.to_ulong()};
+    h = hash_bytes(scalars, sizeof scalars, h);
+    h = hash_bytes(u.loc_framebufferFetchSize, sizeof u.loc_framebufferFetchSize, h);
+    h = hash_bytes(u.loc_streamoutBufferBase, sizeof u.loc_streamoutBufferBase, h);
+    for (auto& e : u.list_ufTexRescale) {
+        const int32_t v[2] = {(int32_t)e.texUnit, e.uniformLocation};
+        h = hash_bytes(v, sizeof v, h);
+    }
+    for (auto& e : d->list_remappedUniformEntries_register) h = hash_bytes(&e, sizeof e, h);
+    for (auto& g : d->list_remappedUniformEntries_bufferGroups) {
+        const uint16_t v[2] = {g.bufferId, g.kcacheBankIdOffset};
+        h = hash_bytes(v, sizeof v, h);
+        for (auto& e : g.entries) h = hash_bytes(&e, sizeof e, h);
+    }
+    for (auto& q : d->list_quickBufferList) {
+        const uint32_t v[2] = {q.index, q.size};
+        h = hash_bytes(v, sizeof v, h);
+    }
+    return h;
+}
+// ---- shader keys already translated (shaderkeys-*.bin next to shaders.bin): key -> the identity of
+// its translation (Shader::canon). Hundreds of render-state variants of a program translate to the
+// same shader; with this, a variant seen in an earlier session takes the translation of one already
+// made (from the cache's records) instead of being translated again: entering an area translated
+// 300-500 of them in one frame (~0.4 ms each, a 100-450 ms hitch). The file is per app version (a
+// new translator may translate a key differently). Records: uint64 key, uint64 canon.
+static std::vector<std::pair<uint64_t, uint64_t>> g_key_canon_sorted;  // loaded, sorted by key
+static std::unordered_map<uint64_t, uint64_t> g_key_canon_new;            // added this session
+static std::unordered_map<uint64_t, Shader*> g_canon_shader;              // canon -> a shader with it
+static FILE* g_keys_out = nullptr;
+
+static void key_canon_open(const std::string& dir) {
+    const char* v = getenv("WWHD_APP_VERSION");
+    std::string path = dir + "/shaderkeys-" + (v ? v : "dev") + "-1.bin";
+    // other versions' tables
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.rfind("shaderkeys-", 0) == 0 && dir + "/" + n != path) remove((dir + "/" + n).c_str());
+        }
+        closedir(d);
+    }
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        uint64_t r[2];
+        while (fread(r, sizeof r, 1, f) == 1) g_key_canon_sorted.push_back({r[0], r[1]});
+        fclose(f);
+        // the last record of a key wins
+        std::stable_sort(g_key_canon_sorted.begin(), g_key_canon_sorted.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        std::vector<std::pair<uint64_t, uint64_t>> u;
+        u.reserve(g_key_canon_sorted.size());
+        for (auto& e : g_key_canon_sorted) {
+            if (!u.empty() && u.back().first == e.first) u.back() = e;
+            else u.push_back(e);
+        }
+        g_key_canon_sorted.swap(u);
+    }
+    g_keys_out = fopen(path.c_str(), "ab");
+}
+
+static bool key_canon_find(uint64_t key, uint64_t& canon) {
+    auto it = g_key_canon_new.find(key);
+    if (it != g_key_canon_new.end()) { canon = it->second; return true; }
+    auto lb = std::lower_bound(g_key_canon_sorted.begin(), g_key_canon_sorted.end(), key, [](auto& e, uint64_t k) { return e.first < k; });
+    if (lb == g_key_canon_sorted.end() || lb->first != key) return false;
+    canon = lb->second;
+    return true;
+}
+
+static void key_canon_add(uint64_t key, uint64_t canon) {
+    uint64_t known;
+    if (key_canon_find(key, known) && known == canon) return;
+    g_key_canon_new[key] = canon;
+    if (g_keys_out) {
+        uint64_t r[2] = {key, canon};
+        fwrite(r, sizeof r, 1, g_keys_out);
+    }
+}
+
+// by source hash and fingerprint: the translation the shaders with it share. Variants of one
+// program (different render state, same output) are most of the ~300k shaders of a large cache; a
+// translation object each was hundreds of MB.
+static std::unordered_map<uint64_t, LatteDecompilerShader*> g_dec_shared;
+
+// attach the shader to the module for its translation, compiling that module if it is new; with
+// defer (the cache replay) a new module is only created, keeping the source, and compiled later
+static void compile_shader(Shader* sh, bool defer = false) {
     std::string src = sh->dec->strBuf_shaderSource->c_str();
     // Depth-only and shaded variants of the same geometry must rasterize identical positions:
     // later passes depth-test EQUAL/LEQUAL against the first, and without invariance the driver
     // may compute gl_Position differently per shader (camera-dependent z-fighting: shadow flicker,
-    // moire on the ground). As the original project's Vulkan renderer (and Metal's [[invariant]]).
-    static const bool noInvariant = getenv("WWHD_NO_INVARIANT") != nullptr;  // debug: as before
-    if (sh->vertex && !noInvariant) {
-        if (size_t main = src.find("void main("); main != std::string::npos) src.insert(main, "invariant gl_Position;\n");
+    // moire on the ground). Same as the official Vulkan renderer (and Metal's [[invariant]]).
+    if (sh->vertex) {
+        if (size_t main = src.find("void main("); main != std::string::npos)
+            src.insert(main, "invariant gl_Position;\n");
+    }
+    // The Outset Island sun-shadow mask compares against a D16 cascade. Qualcomm's Vulkan driver
+    // does not reproduce Latte's large polygon offset closely enough here, leaving the receiver to
+    // self-shadow in a dense grid. Apply the game's 80-unit constant D16 bias at comparison time as
+    // a driver-independent equivalent (reference <= stored depth for the LEQUAL shadow sampler).
+    // Disabled by default (the official renderer has no such bias); WWHD_SHADOW_RECEIVER_BIAS=1 restores it.
+    static const bool receiverBiasOn = getenv("WWHD_SHADOW_RECEIVER_BIAS") != nullptr;
+    if (receiverBiasOn && !sh->vertex && src.find("// shader c2b1a9c7373b844a") != std::string::npos) {
+        const char* sample =
+            "R3i.x = floatBitsToInt(texture(textureUnitPS1, vec4(intBitsToFloat(R3i.x),intBitsToFloat(R3i.y),intBitsToFloat(R3i.z),intBitsToFloat(R3i.w))));";
+        if (size_t p = src.find(sample); p != std::string::npos) {
+            constexpr const char* receiverBias =
+                "R3i.w = floatBitsToInt(max(intBitsToFloat(R3i.w) - 0.001220703125, 0.0));\r\n"
+                "R0i.w = floatBitsToInt(max(intBitsToFloat(R0i.w) - 0.001220703125, 0.0));\r\n";
+            src.insert(p, receiverBias);
+        }
+    }
+    // the game's Gaussian blur on upscaled targets: each tap covers one guest texel (area_sample.h)
+    if (sh->areaUnits && vk_area_sample::rewrite(src, sh->areaUnits) <= 0) LOG("[gfx] pixel shader: area-sampled taps not applied");
+    // debug: WWHD_DUMP_SHADER=<key>[,<key>…] (hex, as the GPU breadcrumbs name them) writes the
+    // translation to shader_<key>.glsl in the files folder
+    static const char* dumpKeys = getenv("WWHD_DUMP_SHADER");
+    if (dumpKeys) {
+        char k[20];
+        snprintf(k, sizeof k, "%016llx", (unsigned long long)sh->key);
+        if (strstr(dumpKeys, k)) {
+            char name[48];
+            snprintf(name, sizeof name, "shader_%s.glsl", k);
+            if (FILE* f = fopen(name, "w")) { fputs(src.c_str(), f); fclose(f); }
+            LOG("[gfx] shader %s written to %s", k, name);
+        }
     }
     uint64_t hash = hash_bytes(src.data(), src.size(), sh->vertex ? 0x5653ull : 0x5053ull) ^ src.size();
     auto it = g_modules.find(hash);
+    free_source(sh);
+    {
+        sh->canon = hash ^ dec_fingerprint(sh->dec) * 0x9E3779B97F4A7C15ull;
+        LatteDecompilerShader*& shared = g_dec_shared[sh->canon];
+        if (!shared) shared = sh->dec;
+        else if (shared != sh->dec) {
+            delete sh->dec;
+            sh->dec = shared;
+        }
+    }
     if (it != g_modules.end()) {
         sh->mod = it->second;
         g_module_cache_hits++;
+        if (!defer) start_module(sh->mod);
         return;
     }
     auto* m = new Module();
     g_modules[hash] = m;
     sh->mod = m;
-    uint64_t key = sh->key;
-    bool vertex = sh->vertex;
+    if (defer) {
+        m->state = CS_DEFERRED;
+        m->pending = std::move(src);
+        m->hash = hash;
+        m->key = sh->key;
+        m->vertex = sh->vertex;
+        g_deferred_modules.push_back(m);
+        return;
+    }
+    compile_module(m, hash, sh->key, sh->vertex, std::move(src));
+}
+
+static void compile_module(Module* m, uint64_t hash, uint64_t key, bool vertex, std::string src) {
     if (g_sync_shaders) {
         compile_now(m, hash, key, vertex, src);
         return;
     }
     g_compiles_in_flight++;
-    g_workers.push([m, hash, key, vertex, src] {
+    g_workers.push([m, hash, key, vertex, src = std::move(src)] {
         compile_now(m, hash, key, vertex, src);
         g_compiles_in_flight--;
     });
@@ -470,7 +825,6 @@ static void create_set_layout(Shader* sh) {
     cache[h] = sh->dsl;
 }
 
-// registers that influence how a shader stage is translated (gathered, then hashed in one pass)
 // The registers the shader key takes whole (stage_state_hash); shader_reg_relevant below derives
 // from this table and the masked ones in stage_state_hash, so keep both in step.
 static const struct { uint32_t first, count; } kKeyRegs[] = {
@@ -480,11 +834,56 @@ static const struct { uint32_t first, count; } kKeyRegs[] = {
     {REGADDR::PA_CL_VTE_CNTL, 1}, {REGADDR::PA_CL_CLIP_CNTL, 1}, {REGADDR::CB_COLOR_CONTROL, 1}, {REGADDR::CB_TARGET_MASK, 1},
     {mmCB_COLOR0_INFO, 8}};
 
-static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase) {
-    uint32_t buf[400];
+// the register state that shapes a stage's translation, as words (hashed into the shader key).
+// texMask / samplerMask: the texture units and samplers the program uses (prog_tex below; all until
+// it is known): the others' words are left out as zeros. They keep the state of earlier draws and
+// don't change the translation (the decompiler reads only the units the program samples), but in
+// the key they made one shader into hundreds of variants: 276k translated (17 s at every start,
+// ~700 MB) for ~3k distinct shaders, the memory that got the game killed when changing areas.
+// A pixel shader's key leaves out the vertex fetch semantics (SQ_VTX_SEMANTIC_*: only vertex shaders
+// read them, for their attribute loads), which changed with every mesh drawn; `legacy` keeps them
+// (the keys the cache's pipeline recipes were recorded with).
+// The colour target registers enter a translation only through which targets the pixel shader
+// writes (LatteMRT::GetActiveColorBufferMask: colour output disabled, a target whose channel mask is
+// all zero) and each target's format, number type and tiling (the analyzer's render-target-as-texture
+// check). Their other bits are pipeline state (blend and ROP, which channels are written, rounding,
+// endianness) and, in the key, made every area load translate hundreds of shaders again (100-230 ms
+// hitches on entering an area, also one visited before), with the same GLSL each time. `cbFull` keeps
+// the whole words and the unused slots below (the keys of the v1.9 cache's pipeline recipes); a vertex
+// shader reads none of them.
+static uint32_t cb_key_word(const uint32_t* regs, uint32_t r, bool vertex) {
+    const uint32_t v = regs[r];
+    if (vertex) return 0;
+    if (r == REGADDR::CB_COLOR_CONTROL) return ((v >> 4) & 7) == 1;  // SPECIAL_OP == DISABLE
+    if (r == REGADDR::CB_TARGET_MASK) {
+        uint32_t m = 0;
+        for (int i = 0; i < 8; i++) m |= ((v >> (i * 4)) & 0xF) ? 1u << i : 0;
+        return m;
+    }
+    return v & 0x7FFC;  // CB_COLORn_INFO: format, array (tile) mode, number type
+}
+
+static uint32_t stage_state_words(const uint32_t* regs, uint32_t texBase, uint32_t* buf, uint32_t texMask = 0x3FFFF,
+                                  uint64_t samplerMask = ~0ull, bool legacy = false, bool cbFull = false) {
     uint32_t n = 0;
+    const bool pixel = texBase == REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
     for (auto& k : kKeyRegs) {
         memcpy(&buf[n], &regs[k.first], k.count * 4);
+        if (k.first == mmSQ_VTX_SEMANTIC_0 && !legacy && pixel)
+            memset(&buf[n], 0, k.count * 4);
+        if (!legacy && !cbFull && (k.first == REGADDR::CB_COLOR_CONTROL || k.first == REGADDR::CB_TARGET_MASK || k.first == mmCB_COLOR0_INFO))
+            for (uint32_t i = 0; i < k.count; i++) buf[n + i] = cb_key_word(regs, k.first + i, !pixel);
+        // slots past those in use keep an earlier shader's values: the vertex shader's exports
+        // (SPI_VS_OUT_CONFIG VS_EXPORT_COUNT + 1, four semantic IDs per register) and the pixel
+        // shader's inputs (SPI_PS_IN_CONTROL_0 NUM_INTERP); the decompiler reads no further
+        if (!legacy && !cbFull && k.first == mmSPI_VS_OUT_ID_0) {
+            const uint32_t used = (((regs[mmSPI_VS_OUT_CONFIG] >> 1) & 0x1F) + 1 + 3) / 4;
+            for (uint32_t i = used; i < k.count; i++) buf[n + i] = 0;
+        }
+        if (!legacy && !cbFull && k.first == mmSPI_PS_INPUT_CNTL_0) {
+            const uint32_t used = regs[mmSPI_PS_IN_CONTROL_0] & 0x3F;
+            for (uint32_t i = used; i < k.count; i++) buf[n + i] = 0;
+        }
         n += k.count;
     }
     uint32_t cbBase[8];
@@ -495,6 +894,12 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
     buf[n++] = regs[REGADDR::DB_DEPTH_CONTROL] & 0x83;
     // texture types and formats
     for (int t = 0; t < 18; t++) {
+        if (!(texMask >> t & 1)) {
+            buf[n++] = 0;
+            buf[n++] = 0;
+            buf[n++] = 0;
+            continue;
+        }
         const uint32_t* w = &regs[texBase + t * 7];
         buf[n++] = (w[0] & 7) | (w[4] & 0x300);
         buf[n++] = w[1] & 0x3F00000;
@@ -505,7 +910,23 @@ static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texB
         buf[n++] = fb;
     }
     // depth-compare samplers
-    for (int i = 0; i < 18 * 3; i++) buf[n++] = regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000;
+    for (int i = 0; i < 18 * 3; i++) buf[n++] = samplerMask >> i & 1 ? regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + i * 3] & 0xF8000000 : 0;
+    return n;
+}
+
+static bool g_cache_replaying = false;  // the shader cache's recipes are being replayed (cache_load)
+
+// per program (microcode hash and stage): the texture units it samples and their samplers, from its
+// first translation (the microcode alone decides them)
+struct ProgTex { uint32_t tex; uint64_t samplers; };
+static std::unordered_map<uint64_t, ProgTex> g_prog_tex;
+// during the cache replay: shader keys as recorded before the masking above (the pipeline recipes
+// name their shaders by those) to the shader now; emptied once the recipes are translated
+static std::unordered_map<uint64_t, Shader*> g_key_alias;
+
+static uint64_t stage_state_hash(const uint32_t* regs, uint64_t h, uint32_t texBase) {
+    uint32_t buf[400];
+    uint32_t n = stage_state_words(regs, texBase, buf);
     return hash_bytes(buf, n * 4, h);
 }
 
@@ -556,19 +977,59 @@ static bool shader_reg_relevant(uint32_t reg, uint32_t oldv, uint32_t newv) {
 }
 static bool g_reg_filter_set = (g_shader_reg_filter = &shader_reg_relevant, true);
 
-static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey);
+// Console-accurate blur on upscaled targets (area_sample.h; graphics setting, off by default:
+// its extra texture reads cost a lot of GPU time at 3x). Part of the blur shaders' keys, so a
+// switch takes effect on the next frame.
+static std::atomic<bool> g_area_blur{getenv("WWHD_AREA_BLUR") && atoi(getenv("WWHD_AREA_BLUR")) != 0};
 
-static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
+// A pixel shader translated for the draw's vertex shader: the semantic ids that vertex shader
+// exports (its output parameters through SPI_VS_OUT_ID) and the PS inputs none of them feeds. Those
+// inputs are constants in the translation, the GPU's default value for them (SPI_PS_INPUT_CNTL
+// DEFAULT_VAL; LatteDecompilerOptions::linkPSInputsToVS) instead of inputs no output writes, whose
+// values are undefined and which some drivers refuse (original project 73c5a3d, issue #30).
+struct PsLink {
+    bool linked = false;
+    std::bitset<256> exports;
+    uint32_t unfed = 0;  // bit f: PS input f has no vertex shader output
+    uint64_t key = 0;    // unfed inputs and their DEFAULT_VAL, for the shader key
+};
+static PsLink ps_link(const uint32_t* regs, const Shader* vs) {
+    PsLink link;
+    if (!vs || !vs->dec) return link;
+    link.linked = true;
+    const uint32_t mask = vs->dec->outputParameterMask;
+    for (uint32_t i = 0; i < 32; ++i)
+        if (mask & (1u << i)) link.exports.set((regs[mmSPI_VS_OUT_ID_0 + i / 4] >> (8 * (i % 4))) & 0xFF);
+    const uint32_t control0 = regs[mmSPI_PS_IN_CONTROL_0];
+    const uint32_t inputs = std::min<uint32_t>(control0 & 0x3F, GPU7_PS_MAX_INPUTS);
+    const uint32_t position = (control0 >> 8) & 1 ? (control0 >> 10) & 0x1F : 0xFFFFFFFFu;
+    uint32_t words[1 + GPU7_PS_MAX_INPUTS];
+    uint32_t n = 1;
+    for (uint32_t f = 0; f < inputs; ++f)
+        if (f != position && !link.exports.test(regs[mmSPI_PS_INPUT_CNTL_0 + f] & 0xFF)) {
+            link.unfed |= 1u << f;
+            words[n++] = (regs[mmSPI_PS_INPUT_CNTL_0 + f] >> 8) & 3;
+        }
+    words[0] = link.unfed;
+    link.key = link.unfed ? hash_bytes(words, n * 4, 0x5053'4C49'4E4Bull) : 0;
+    return link;
+}
+
+static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey,
+                                   const PsLink& link = PsLink{});
+
+static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey, const Shader* vs = nullptr) {
     const uint32_t start = vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS;
     const uint32_t addr = regs[start], size = regs[start + 1];
     // nothing shader-relevant changed since the previous draw: same shader
-    struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; uint32_t addr = 0, size = 0; Shader* s = nullptr; };
+    struct Last { uint64_t gen = 0, frame = ~0ull, fsKey = 0; uint32_t addr = 0, size = 0; const Shader* vs = nullptr; Shader* s = nullptr; };
     static Last last[2];
     Last& L = last[vertex ? 0 : 1];
-    if (L.gen == g_shader_state_gen && L.frame == R.frame && L.addr == addr && L.size == size && (!vertex || L.fsKey == fsKey))
+    if (L.gen == g_shader_state_gen && L.frame == R.frame && L.addr == addr && L.size == size && (!vertex || L.fsKey == fsKey) &&
+        (vertex || L.vs == vs))
         return L.s;
     // the same state with another program (the game switches between a few): remembered per program
-    struct Memo { uint64_t gen = 0, frame = ~0ull; std::unordered_map<uint64_t, Shader*> m; };
+    struct Memo { uint64_t gen = 0, frame = ~0ull; FlatTable<Shader*> m; };
     static Memo memo[2];
     Memo& M = memo[vertex ? 0 : 1];
     if (M.gen != g_shader_state_gen || M.frame != R.frame) {
@@ -576,61 +1037,184 @@ static Shader* get_shader(const uint32_t* regs, bool vertex, LatteFetchShader* f
         M.gen = g_shader_state_gen;
         M.frame = R.frame;
     }
-    uint64_t mk = ((uint64_t)addr << 32 | size) ^ (vertex ? fsKey * 0x9E3779B97F4A7C15ull : 0);
-    auto it = M.m.find(mk);
-    Shader* s = it != M.m.end() ? it->second : (M.m[mk] = get_shader_uncached(regs, vertex, fs, fsKey));
-    L = Last{g_shader_state_gen, R.frame, fsKey, addr, size, s};
+    uint64_t mk = ((uint64_t)addr << 32 | size) ^ (vertex ? fsKey * 0x9E3779B97F4A7C15ull : (uint64_t)(uintptr_t)vs * 0xC2B2AE3D27D4EB4Full);
+    Shader** it = M.m.find(mk);
+    Shader* s = it ? *it
+                   : (M.m[mk] = get_shader_uncached(regs, vertex, fs, fsKey, vertex ? PsLink{} : ps_link(regs, vs)));
+    L = Last{g_shader_state_gen, R.frame, fsKey, addr, size, vs, s};
     return s;
 }
 
 static void cache_record_shader(const uint32_t* regs, bool vertex);
 static bool g_defer_compiles = false;
-static std::vector<Shader*> g_deferred_shaders;
 
 static void compile_deferred(Shader* s) {
-    if (s->state != CS_DEFERRED) return;
-    s->state = CS_PENDING;
-    compile_shader(s);
+    if (s && s->mod) start_module(s->mod);
 }
 
-static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey) {
+static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetchShader* fs, uint64_t fsKey,
+                                   const PsLink& link) {
     uint32_t addr = regs[vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS] << 8;
     uint32_t size = regs[(vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS) + 1] << 3;
     if (!addr || !size) return nullptr;
     uint64_t key = program_hash(addr, size) ^ (vertex ? 0x1111 : 0x2222);
     uint64_t base = key;
-    key = stage_state_hash(regs, key, vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS);
-    if (vertex) key ^= fsKey * 31;
+    // recent lookups: the same program with the same state words is the same shader (comparing the
+    // words is cheaper than hashing them and looking the key up)
+    struct Memo { uint64_t base, fsKey; uint32_t n; uint32_t words[400]; Shader* s; };
+    static Memo memo[64];
+    uint32_t words[400];
+    const uint32_t texBase = vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+    auto pt = g_prog_tex.find(base);
+    const bool masked = pt != g_prog_tex.end();
+    uint32_t n = masked ? stage_state_words(regs, texBase, words, pt->second.tex, pt->second.samplers)
+                        : stage_state_words(regs, texBase, words);
+    const uint32_t area = !vertex && g_area_blur.load(std::memory_order_relaxed)
+                              ? vk_area_sample::units_for_pixel_shader(mem::ptr(addr), size) : 0;
+    uint64_t fk = vertex ? fsKey : link.key ^ ((uint64_t)area << 56);
+    Memo& m = memo[(base ^ (base >> 21) ^ fk) & 63];
+    // the cache replay: the key the record had (all units), for the pipeline recipes that name it
+    uint64_t oldKey = 0;
+    auto finish_key = [&](uint64_t k, const uint32_t* w, uint32_t count) {
+        k = hash_bytes(w, count * 4, k);
+        // vertex inputs decoded on the CPU (PowerVR) translate differently: their own keys, also in
+        // the key tables of earlier sessions (shaderkeys); 0 elsewhere
+        if (vertex) k ^= fsKey * 31 ^ (uint64_t)R.vertexCpuClasses * 0x9E3779B97F4A7C15ull;
+        else k ^= link.key * 37 ^ (uint64_t)area * 0x9E3779B97F4A7C15ull;  // link.key 0 when every input is fed
+        return k;
+    };
+    uint64_t v19Key = 0;  // the key as v1.9 made it (whole colour target words), for its recipes
+    if (g_cache_replaying) {
+        uint32_t full[400];
+        uint32_t fn = stage_state_words(regs, texBase, full, 0x3FFFF, ~0ull, true);
+        oldKey = finish_key(key, full, fn);
+        fn = masked ? stage_state_words(regs, texBase, full, pt->second.tex, pt->second.samplers, false, true)
+                    : stage_state_words(regs, texBase, full, 0x3FFFF, ~0ull, false, true);
+        v19Key = finish_key(key, full, fn);
+    }
+    if (m.s && m.base == base && m.fsKey == fk && m.n == n && memcmp(m.words, words, n * 4) == 0) {
+        if (oldKey && oldKey != m.s->key) g_key_alias[oldKey] = m.s;
+        if (v19Key && v19Key != m.s->key) g_key_alias[v19Key] = m.s;
+        return m.s;
+    }
+    key = finish_key(key, words, n);
+    // debug: WWHD_KEY_DIFF=1 logs which state words made a known program into a new shader key
+    static const bool keyDiff = getenv("WWHD_KEY_DIFF") != nullptr;
+    if (keyDiff && !g_shaders.count(key)) {
+        struct Seen { uint32_t n; uint32_t w[400]; uint64_t fk; };
+        static std::unordered_map<uint64_t, Seen> seen;
+        static int logged = 0;
+        auto sit = seen.find(base);
+        if (sit != seen.end() && logged < 400) {
+            std::string d;
+            for (uint32_t i = 0; i < std::min(n, sit->second.n) && d.size() < 300; i++)
+                if (words[i] != sit->second.w[i]) d += " [" + std::to_string(i) + "] " + std::to_string(sit->second.w[i]) + "->" + std::to_string(words[i]);
+            if (fk != sit->second.fk) d += " fk";
+            if (n != sit->second.n) d += " n";
+            LOG("[keydiff] %s %016llx:%s", vertex ? "vs" : "ps", (unsigned long long)base, d.c_str());
+            logged++;
+        }
+        Seen& sn = seen[base];
+        sn.n = n;
+        memcpy(sn.w, words, n * 4);
+        sn.fk = fk;
+    }
+    auto remember = [&](Shader* sh) {
+        if (oldKey && oldKey != sh->key) g_key_alias[oldKey] = sh;
+        if (v19Key && v19Key != sh->key) g_key_alias[v19Key] = sh;
+        m.base = base;
+        m.fsKey = fk;
+        m.n = n;
+        memcpy(m.words, words, n * 4);
+        m.s = sh;
+        return sh;
+    };
+    ShaderHot& hot = shader_hot(key);
+    g_shader_lookups++;
+    if (hot.s && hot.key == key) return remember(hot.s);
+    g_shader_map_lookups++;
     auto it = g_shaders.find(key);
-    if (it != g_shaders.end()) return it->second;
+    if (it != g_shaders.end()) {
+        hot = {key, it->second};
+        return remember(it->second);
+    }
 
+    // a key translated before (shaderkeys): the translation of the shader with the same identity
+    if (uint64_t canon; key_canon_find(key, canon)) {
+        auto c = g_canon_shader.find(canon);
+        if (c != g_canon_shader.end()) {
+            const Shader* o = c->second;
+            auto* s = new Shader();
+            s->key = key;
+            s->vertex = vertex;
+            s->dec = o->dec;
+            s->areaUnits = o->areaUnits;
+            s->mod = o->mod;
+            s->dsl = o->dsl;
+            s->bindings = o->bindings;
+            s->dynamicUbos = o->dynamicUbos;
+            s->varsRange = o->varsRange;
+            memcpy(s->blockRange, o->blockRange, sizeof s->blockRange);
+            s->state.store(o->state.load());
+            s->canon = canon;
+            g_shaders[key] = s;
+            hot = {key, s};
+            if (oldKey && oldKey != key) g_key_alias[oldKey] = s;
+            if (v19Key && v19Key != key) g_key_alias[v19Key] = s;
+            g_shaders_reused++;
+            return remember(s);
+        }
+    }
     auto* s = new Shader();
     s->key = key;
     s->vertex = vertex;
     g_shaders[key] = s;
+    hot = {key, s};
+    if (oldKey && oldKey != key) g_key_alias[oldKey] = s;
+    if (v19Key && v19Key != key) g_key_alias[v19Key] = s;
     double t0 = now_ms();
     LatteShader_UpdatePSInputs((uint32*)regs);
     LatteDecompilerOptions opt;
-    if (!vertex) opt.areaSampledTextures = ::gfx::area_sample::units_for_pixel_shader(mem::ptr(addr), size);
+    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: the black letter in the
+    // Rito mail sorting game); Cemu's default too (original project 0dfd3c3). WWHD_STRICT_MUL=0: off
+    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
+    opt.strictMul = strictMul;
+    // pixel colours without NaN / infinity (LatteDecompiler.h): the thunderstorm's flash blacked out the
+    // 3D picture for a few frames. WWHD_NAN_GUARD=0: as the shader computes them
+    static const bool nanGuard = !getenv("WWHD_NAN_GUARD") || strcmp(getenv("WWHD_NAN_GUARD"), "0");
+    opt.finiteColorOutputs = nanGuard;
+    if (!vertex && link.linked) {
+        opt.linkPSInputsToVS = true;
+        opt.vsOutputSemantics = link.exports;
+    }
+    if (!vertex) opt.areaSampledTextures = s->areaUnits = area;
     LatteDecompilerOutput_t out{};
+    if (compile_journal_bad(kCjTranslation, key)) {  // it crashed the translator before: left out
+        s->state = CS_FAILED;
+        return s;
+    }
+    compile_journal_begin(kCjTranslation, key);
     if (vertex)
         LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
     else
         LatteDecompiler_DecompilePixelShader(base, (uint32*)regs, mem::ptr(addr), size, opt, &out);
+    compile_journal_end();
     if (!out.shader || out.shader->hasError || !out.shader->strBuf_shaderSource) {
         LOG("[gfx] %s shader %08X failed to translate", vertex ? "vertex" : "pixel", addr);
         s->state = CS_FAILED;
         return s;
     }
     s->dec = FinishDecompiledShader(out);
-    if (opt.areaSampledTextures) {
-        std::string src = s->dec->strBuf_shaderSource->c_str();
-        if (::gfx::area_sample::rewrite(src, opt.areaSampledTextures, false) > 0) {
-            s->dec->strBuf_shaderSource->reset();
-            s->dec->strBuf_shaderSource->add(std::string_view(src));
-        } else {
-            LOG("[gfx] pixel shader %08X: area-sampled taps not applied", addr);
+    if (!masked) {
+        ProgTex t{0, 0};
+        const uint32_t samplerBase = vertex ? SAMPLER_BASE_INDEX_VERTEX : SAMPLER_BASE_INDEX_PIXEL;
+        for (int u = 0; u < LATTE_NUM_MAX_TEX_UNITS; u++) {
+            if (!s->dec->textureUnitMask2[u]) continue;
+            t.tex |= 1u << u;
+            uint32_t smp = s->dec->textureUnitSamplerAssignment[u];
+            if (smp < LATTE_NUM_MAX_TEX_UNITS) t.samplers |= 1ull << (samplerBase + smp);
         }
+        g_prog_tex[base] = t;
     }
     create_set_layout(s);
     cache_record_shader(regs, vertex);
@@ -643,11 +1227,11 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         snprintf(name, sizeof name, "/%s_%08X_%016llx.glsl", vertex ? "vs" : "ps", addr, (unsigned long long)key);
         if (FILE* f = fopen((dir + name).c_str(), "w")) { fputs(s->dec->strBuf_shaderSource->c_str(), f); fclose(f); }
     }
-    if (g_defer_compiles) {
-        s->state = CS_DEFERRED;  // cache replay: compile on first use or gradually in the background
-        g_deferred_shaders.push_back(s);
-    } else {
-        compile_shader(s);
+    // cache replay: new modules are compiled on first use or gradually in the background
+    compile_shader(s, g_defer_compiles);
+    if (s->canon) {
+        g_canon_shader.emplace(s->canon, s);
+        key_canon_add(key, s->canon);
     }
     static uint32_t count = 0;
     if (++count % 100 == 0) LOG("[gfx] %u shaders translated", count);
@@ -710,9 +1294,12 @@ struct PassFormats {  // only uint32 members: hashed as raw bytes
     uint32_t stencil = 0;
 };
 
-static VkRenderPass get_render_pass(const PassFormats& pf) {
+// `clears`: attachments the pass clears as it begins (bit i colour i, bit 8 depth, bit 9 stencil;
+// Image::pendingClearLayers) instead of loading them. Load operations don't take part in render pass
+// compatibility: pipelines and framebuffers are made with the variant without clears.
+static VkRenderPass get_render_pass(const PassFormats& pf, uint32_t clears = 0) {
     static std::unordered_map<uint64_t, VkRenderPass> cache;
-    uint64_t h = hash_bytes(&pf, sizeof pf);
+    uint64_t h = hash_bytes(&pf, sizeof pf, clears);
     auto it = cache.find(h);
     if (it != cache.end()) return it->second;
     std::vector<VkAttachmentDescription> atts;
@@ -725,7 +1312,7 @@ static VkRenderPass get_render_pass(const PassFormats& pf) {
         VkAttachmentDescription a{};
         a.format = (VkFormat)pf.color[i];
         a.samples = VK_SAMPLE_COUNT_1_BIT;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.loadOp = clears >> i & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -738,9 +1325,9 @@ static VkRenderPass get_render_pass(const PassFormats& pf) {
         VkAttachmentDescription a{};
         a.format = (VkFormat)pf.depth;
         a.samples = VK_SAMPLE_COUNT_1_BIT;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.loadOp = clears >> 8 & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        a.stencilLoadOp = pf.stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilLoadOp = !pf.stencil ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : clears >> 9 & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         a.stencilStoreOp = pf.stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
         a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depthRef = {(uint32_t)atts.size(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -812,8 +1399,13 @@ struct PipelineState {
     uint32_t frontCCW = 0;
     uint32_t depthControl = 0;  // DB_DEPTH_CONTROL (0 without depth buffer)
     uint32_t depthClamp = 0;
-    uint32_t intTargets = 0;    // bit per color attachment with an integer format
+    uint32_t intTargets = 0;    // bit per color attachment with an integer format; bits 28-31: hud_cov_slot
 };
+// the colour attachment of the HUD coverage (hud_coverage.h; 0: none): the pixel shader's variant.
+// Kept in intTargets' unused bits, so PipelineState (and the shader cache's pipeline recipes, which
+// hold it as it is) keeps its size: a larger one made every cached recipe unreadable.
+static uint32_t hud_cov_slot(const PipelineState& st) { return st.intTargets >> 28; }
+static void set_hud_cov_slot(PipelineState& st, uint32_t slot) { st.intTargets = (st.intTargets & 0x0FFFFFFFu) | (slot << 28); }
 
 struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;   // valid once status == CS_READY
@@ -842,17 +1434,29 @@ static VkPipelineLayout get_pipeline_layout(Shader* vs, Shader* ps) {
     return l;
 }
 
-// Ambient-occlusion quirks, switchable in game (settings menu; WWHD_AO_MODE=0..2 sets the start):
+// Ambient-occlusion quirks, switchable in game (settings menu; WWHD_AO_MODE=0..3 sets the start):
 //   0 = as the hardware renders it
 //   1 = centre depth sampled bilinear (removes the every-third-row lines)
 //   2 = 1 + noise tiled per 960x540 pixel instead of per 640x360 pixel (removes the remaining
 //       uneven noise bands the game's blur can't average out)
+//   3 = disabled (the AO pass writes neutral white)
 static std::atomic<int> g_ao_mode{[] {
-    if (const char* e = getenv("WWHD_AO_MODE")) return atoi(e) % 3;
+    if (const char* e = getenv("WWHD_AO_MODE")) return std::clamp(atoi(e), 0, 3);
     return getenv("WWHD_NO_AO_QUIRK") ? 0 : 2;
 }()};
 int ao_mode() { return g_ao_mode.load(std::memory_order_relaxed); }
-void set_ao_mode(int m) { g_ao_mode = m % 3; LOG("[gfx] ambient occlusion mode %d", m % 3); }
+// Bloom strength (graphics setting, percent; original project 8ebcc6f): the bloom extract shader
+// (PS 44F91200) reads its intensity from remapped[2].z (cThresholdParam.z); scaled once there,
+// before the blur and downsampling. 100 the original game, 0 off, up to 200.
+static std::atomic<int> g_bloom_pct{[] {
+    const char* e = getenv("WWHD_BLOOM_STRENGTH");
+    return e ? std::clamp((int)(atof(e) * 100.0f), 0, 200) : 100;
+}()};
+bool area_blur() { return g_area_blur.load(std::memory_order_relaxed); }
+void set_area_blur(bool on) { g_area_blur = on; LOG("[gfx] console-accurate blur %s", on ? "on" : "off"); }
+int bloom_strength() { return g_bloom_pct.load(std::memory_order_relaxed); }
+void set_bloom_strength(int pct) { g_bloom_pct = std::clamp(pct, 0, 200); LOG("[gfx] bloom strength %d%%", g_bloom_pct.load()); }
+void set_ao_mode(int m) { m = std::clamp(m, 0, 3); g_ao_mode = m; LOG("[gfx] ambient occlusion mode %d", m); }
 
 // Draws whose shaders or pipeline are still compiling wait for the compile, up to a per-frame budget
 // (WWHD_COMPILE_WAIT_MS, default 8; the game's frame is 33 ms), and are skipped after it: new things
@@ -921,7 +1525,112 @@ struct PipelineDesc {
 
 static VkPrimitiveTopology topology_of(uint32_t t) { return (VkPrimitiveTopology)t; }
 
+// ---------------------------------------------------------------- HUD coverage (60 fps generated)
+// From the first layout drawn on the TV picture (rp::layout_root, where the scene is copied aside)
+// each draw into that picture also writes how much it covers what lies behind: colour 1, an R8
+// image of the picture's size cleared to 0, blended with the factor the draw's own blend gives the
+// picture behind it (1 - that factor, in effect). The in-between frame then moves the scene behind
+// translucent HUD parts too (vk/reproj.cpp), where a mask of "HUD here" left the scene behind them
+// unmoved: a frame of still background around every button and item icon, flickering at 30 Hz
+// while the camera turned. A frame with a HUD draw that couldn't write it (a shader without the
+// variant, another target alongside) is generated the old way. WWHD_HUD_COVERAGE=0: off.
+static bool hud_coverage_on() {
+    static const bool on = (!getenv("WWHD_HUD_COVERAGE") || atoi(getenv("WWHD_HUD_COVERAGE")) != 0);
+    return on && R.features.independentBlend;
+}
+static Surface g_cov;
+static Surface* g_cov_target = nullptr;
+static uint64_t g_cov_frame = ~0ull;
+static bool g_cov_valid = false;
+static uint32_t g_cov_draws = 0;
+struct CovModule { VkShaderModule module; uint32_t location; };
+static std::unordered_map<Module*, CovModule> g_cov_modules;  // module VK_NULL_HANDLE: no variant
+
+void hud_coverage_begin(Surface* tv) {
+    g_cov_frame = ~0ull;
+    if (!tv || !hud_coverage_on() || !tv->img.image) return;
+    if (!g_cov.img.image || g_cov.img.width != tv->img.width || g_cov.img.height != tv->img.height) {
+        if (g_cov.img.image) retire_image(g_cov.img);
+        g_cov.img = Image{};
+        if (!create_image(g_cov.img, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UNORM, tv->img.width, tv->img.height, 1, 1, 1,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false, false,
+                          false))
+            return;
+        g_cov.fmt = FormatInfo{};
+        g_cov.fmt.format = VK_FORMAT_R8_UNORM;
+        g_cov.fmt.renderable = true;
+        g_cov.fmt.kind = FormatInfo::FLOAT;
+        g_cov.slices = 1;
+        g_cov.mips = 1;
+        g_cov.addr = 0;  // private: never found by address lookups
+    }
+    // guest size and scales as the picture's, so draws scale their viewports alike
+    g_cov.width = tv->width;
+    g_cov.height = tv->height;
+    g_cov.rscale = tv->rscale;
+    g_cov.ax = tv->ax;
+    g_cov.ay = tv->ay;
+    // cleared as the first HUD pass begins (or before the in-between frame reads it)
+    g_cov.img.pendingClearLayers = 1;
+    g_cov.img.pendingClearAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    g_cov.img.pendingClearValue = VkClearValue{};
+    g_cov_target = tv;
+    g_cov_frame = R.frame;
+    g_cov_valid = true;
+    g_cov_draws = 0;
+}
+
+// the coverage of `frame`'s HUD, if every HUD draw wrote it (rp::record)
+Image* hud_coverage(uint64_t frame) { return g_cov_frame == frame && g_cov_valid && g_cov.img.image ? &g_cov.img : nullptr; }
+
+static CovModule coverage_module(Module* m) {
+    if (!m || m->state.load(std::memory_order_acquire) != CS_READY || !m->hash) return {VK_NULL_HANDLE, 0};
+    auto it = g_cov_modules.find(m);
+    if (it != g_cov_modules.end()) return it->second;
+    std::vector<uint32_t> spirv;
+    {
+        std::lock_guard<std::mutex> lk(g_spv_mutex);
+        auto d = g_spv_disk.find(m->hash);
+        if (d != g_spv_disk.end() && g_spv_in) {
+            spirv.resize(d->second.words);
+            if (fseek(g_spv_in, d->second.offset, SEEK_SET) != 0 || fread(spirv.data(), 4, spirv.size(), g_spv_in) != spirv.size()) spirv.clear();
+        }
+    }
+    VkShaderModule vm = VK_NULL_HANDLE;
+    uint32_t location = 0;
+    if (!spirv.empty() && hud_coverage::add_output(spirv, location)) {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = spirv.size() * 4;
+        ci.pCode = spirv.data();
+        if (vkCreateShaderModule(R.device, &ci, nullptr, &vm) != VK_SUCCESS) vm = VK_NULL_HANDLE;
+    }
+    static int failures = 0;
+    if (!vm && failures++ < 8) LOG("[framegen] HUD shader %016llx: no coverage variant", (unsigned long long)m->key);
+    g_cov_modules[m] = {vm, location};
+    return {vm, location};
+}
+
+// the coverage attachment's blend from the picture's: what the draw leaves of the picture behind
+static VkPipelineColorBlendAttachmentState coverage_blend(const VkPipelineColorBlendAttachmentState& c0) {
+    VkPipelineColorBlendAttachmentState c{};
+    c.colorWriteMask = (c0.colorWriteMask & 7) ? VK_COLOR_COMPONENT_R_BIT : 0;
+    if (!c0.blendEnable) return c;  // replaces what was there: covered
+    c.blendEnable = VK_TRUE;
+    c.colorBlendOp = c.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkBlendFactor src = VK_BLEND_FACTOR_SRC_ALPHA, dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;  // "over"
+    if (c0.colorBlendOp == VK_BLEND_OP_ADD || c0.colorBlendOp == VK_BLEND_OP_SUBTRACT) switch (c0.dstColorBlendFactor) {
+        case VK_BLEND_FACTOR_ZERO: src = VK_BLEND_FACTOR_ONE; dst = VK_BLEND_FACTOR_ZERO; break;          // replaces
+        case VK_BLEND_FACTOR_ONE: src = VK_BLEND_FACTOR_ZERO; dst = VK_BLEND_FACTOR_ONE; break;           // adds: covers nothing
+        case VK_BLEND_FACTOR_SRC_ALPHA: src = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; dst = VK_BLEND_FACTOR_SRC_ALPHA; break;
+        default: break;
+    }
+    c.srcColorBlendFactor = c.srcAlphaBlendFactor = src;
+    c.dstColorBlendFactor = c.dstAlphaBlendFactor = dst;
+    return c;
+}
+
 static Pipeline* get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, LatteFetchShader* fs, uint64_t fsKey, const PipelineState& st) {
+    if (hud_cov_slot(st) && !coverage_module(ps->mod).module) return nullptr;  // (never a pipeline without its module)
     // shaders with identical translations share pipelines
     Module* mods[2] = {vs->mod, ps->mod};
     uint64_t h = hash_bytes(mods, sizeof mods);
@@ -929,33 +1638,53 @@ static Pipeline* get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, Latt
     h = hash_bytes(&ps->dsl, sizeof(ps->dsl), h);
     h ^= fsKey;
     h = hash_bytes(&st, sizeof st, h);
+    // ~1750 pipelines: the frame's are found in a small table first (pipelines are never freed)
+    static HotCache<Pipeline*, 1024> hot;
+    if (Pipeline** p = hot.find(h)) return wait_compiled((*p)->status) ? *p : nullptr;
     auto it = g_pipelines.find(h);
-    if (it != g_pipelines.end()) return wait_compiled(it->second->status) ? it->second : nullptr;
+    if (it != g_pipelines.end()) {
+        hot.put(h, it->second);
+        return wait_compiled(it->second->status) ? it->second : nullptr;
+    }
     auto* pl = new Pipeline();
     g_pipelines[h] = pl;
+    hot.put(h, pl);
     cache_record_pipeline(regs, vs, ps, fsKey, st);
     pl->layout = get_pipeline_layout(vs, ps);
 
     auto d = std::make_shared<PipelineDesc>();
     d->stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs->mod->module, "main", nullptr};
-    d->stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps->mod->module, "main", nullptr};
-    // vertex input: attributes fetched as uint and decoded (byte-swapped) in the shader
+    d->stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+                    hud_cov_slot(st) ? coverage_module(ps->mod).module : ps->mod->module, "main", nullptr};
+    // vertex input: attributes fetched as uint and decoded (byte-swapped) in the shader; those decoded
+    // on the CPU (vertex_cpu_policy.h, PowerVR) as 4 floats or uints from the group's converted stream
+    const uint32_t cpuMask = R.vertexCpuClasses;
     for (auto& g : fs->bufferGroups) {
-        bool instanced = false, any = false;
+        bool instanced = false, anyRaw = false, anyCpu = false;
+        const uint32_t cpuCount = cpu_vertex_count(g, cpuMask);
+        const uint32_t cpuBinding = cpuCount ? cpu_vertex_binding(*fs, g, cpuMask, R.props.limits.maxVertexInputBindings) : 0;
         for (sint32 j = 0; j < g.attribCount; j++) {
             auto& a = g.attrib[j];
             sint32 loc = vs->dec->resourceMapping.attributeMapping[a.semanticId];
             if (loc < 0) continue;
             VkFormat vf = vertex_format((uint32_t)a.format);
             if (vf == VK_FORMAT_UNDEFINED) continue;
-            d->attribs.push_back({(uint32_t)loc, (uint32_t)g.attributeBufferIndex, vf, (uint32_t)a.offset});
+            if (cpu_vertex_selected(a, cpuMask)) {
+                if (cpuBinding >= R.props.limits.maxVertexInputBindings) continue;  // no binding left (never seen)
+                d->attribs.push_back({(uint32_t)loc, cpuBinding, cpu_vertex_format(a), cpu_vertex_offset(g, j, cpuMask)});
+                anyCpu = true;
+            } else {
+                d->attribs.push_back({(uint32_t)loc, (uint32_t)g.attributeBufferIndex, vf, (uint32_t)a.offset});
+                anyRaw = true;
+            }
             if (a.fetchType == LatteConst::VertexFetchType2::INSTANCE_DATA) instanced = true;
-            any = true;
         }
-        if (!any) continue;
+        if (!anyRaw && !anyCpu) continue;
         uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
-        d->bindings.push_back({(uint32_t)g.attributeBufferIndex, stride,
-                               instanced && stride ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+        const VkVertexInputRate rate = instanced && stride ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+        if (anyRaw) d->bindings.push_back({(uint32_t)g.attributeBufferIndex, stride, rate});
+        // one converted element per guest element: 16 bytes for each selected attribute
+        if (anyCpu) d->bindings.push_back({cpuBinding, stride ? 16 * cpuCount : 0, rate});
     }
     d->vi.vertexBindingDescriptionCount = (uint32_t)d->bindings.size();
     d->vi.pVertexBindingDescriptions = d->bindings.data();
@@ -1030,6 +1759,7 @@ static Pipeline* get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, Latt
     // without independent blending every attachment must use the same state
     if (!R.features.independentBlend && firstUsed >= 0)
         for (uint32_t i = 0; i < colorCount; i++) d->blend[i] = d->blend[firstUsed];
+    if (hud_cov_slot(st) && hud_cov_slot(st) < 8) d->blend[hud_cov_slot(st)] = coverage_blend(d->blend[0]);
     d->cb.attachmentCount = colorCount;
     d->cb.pAttachments = d->blend;
     d->dyn[0] = VK_DYNAMIC_STATE_VIEWPORT;
@@ -1054,12 +1784,25 @@ static Pipeline* get_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, Latt
     d->pi.layout = pl->layout;
     d->pi.renderPass = get_render_pass(st.pass);
 
-    auto build = [pl, d] {
+    // stable across runs (the module pointers in `h` are not): the compile journal's id
+    const uint64_t stableId = hash_bytes(&st, sizeof st, vs->key * 0x100000001B3ull ^ ps->key ^ fsKey * 31);
+    if (compile_journal_bad(kCjPipeline, stableId)) {
+        static int logged = 0;
+        if (logged++ < 8) LOG("[gfx] pipeline %016llx left out (it crashed while compiling)", (unsigned long long)stableId);
+        pl->status.store(CS_FAILED, std::memory_order_release);
+        return nullptr;
+    }
+    auto build = [pl, d, vsKey = vs->key, psKey = ps->key, stableId] {
         auto t0 = std::chrono::steady_clock::now();
-        VkResult r = vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, &d->pi, nullptr, &pl->pipeline);
+        compile_journal_begin(kCjPipeline, stableId);
+        VkResult r = create_graphics_pipeline(&d->pi, &pl->pipeline);
+        compile_journal_end();
         g_t_pipeline_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         if (r != VK_SUCCESS) LOG("[gfx] pipeline creation failed: VkResult %d", (int)r);
-        else g_pipelines_created++;
+        else {
+            g_pipelines_created++;
+            rec::crumb_pipeline(pl->pipeline, vsKey, psKey);
+        }
         pl->status.store(r == VK_SUCCESS ? CS_READY : CS_FAILED, std::memory_order_release);
         compile_done();
     };
@@ -1093,14 +1836,17 @@ static VkSamplerAddressMode address_mode(uint32_t c) {
 // anisotropic filtering on mipmapped, linearly filtered textures
 static std::atomic<bool> g_aniso{[] { const char* e = getenv("WWHD_ANISO"); return e && atoi(e) != 0; }()};
 bool aniso_enabled() { return g_aniso.load(std::memory_order_relaxed); }
+static std::atomic<bool> g_distant_shadows{true};
+bool distant_shadows() { return g_distant_shadows.load(std::memory_order_relaxed); }
+void set_distant_shadows(bool v) { g_distant_shadows = v; LOG("[gfx] distant shadows %s", v ? "on" : "off"); }
 void set_aniso(bool v) { g_aniso = v; LOG("[gfx] anisotropic filtering %s", v ? "on" : "off"); }
 
 // allowAniso: the bound texture is a real mipmapped asset (not a buffer the GPU rendered); the game also
 // reads its screen-sized lighting/occlusion buffers through mip-filtering samplers, and anisotropy there
 // blurs the screen-space effects
-static VkSampler get_sampler(const uint32_t* w, bool allowAniso = false) {
-    const bool anisoForce = allowAniso && aniso_enabled();
-    uint64_t h = hash_bytes(w, 12) ^ (anisoForce ? 0x5A5A5A5A5A5A5A5Aull : 0);
+static VkSampler get_sampler(const uint32_t* w, bool allowAniso = false, bool nearestOnly = false) {
+    const bool anisoForce = allowAniso && aniso_enabled() && !nearestOnly;
+    uint64_t h = hash_bytes(w, 12) ^ (anisoForce ? 0x5A5A5A5A5A5A5A5Aull : 0) ^ (nearestOnly ? 0x4E4E4E4E00000000ull : 0);
     auto it = g_samplers.find(h);
     if (it != g_samplers.end()) return it->second;
     LATTE_SQ_TEX_SAMPLER_WORD0_0 w0;
@@ -1117,6 +1863,10 @@ static VkSampler get_sampler(const uint32_t* w, bool allowAniso = false) {
     d.minFilter = xy((uint32_t)w0.get_XY_MIN_FILTER());
     uint32_t mip = (uint32_t)w0.get_MIP_FILTER();
     d.mipmapMode = mip >= 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    if (nearestOnly) {  // the format can't be filtered (filters_linear)
+        d.magFilter = d.minFilter = VK_FILTER_NEAREST;
+        d.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    }
     float maxAniso = 1.0f;
     if (uint32_t aniso = w0.get_MAX_ANISO_RATIO()) maxAniso = (float)std::min(1u << aniso, 16u);
     if (anisoForce && mip != 0 && d.minFilter == VK_FILTER_LINEAR && (uint32_t)w0.get_DEPTH_COMPARE_FUNCTION() == 0) maxAniso = 16;
@@ -1196,6 +1946,7 @@ struct CachedView {
     VkImageView view;
 };
 static std::unordered_map<uint64_t, CachedView> g_views;
+static HotCache<VkImageView, 1024> g_views_hot;  // the frame's views first; cleared with g_views' erasures
 
 static VkImageView texture_view(Surface* s, VkImageViewType type, uint32_t word4) {
     LATTE_SQ_TEX_RESOURCE_WORD4_N w4;
@@ -1203,8 +1954,12 @@ static VkImageView texture_view(Surface* s, VkImageViewType type, uint32_t word4
     uint32_t sel[4] = {(uint32_t)w4.get_DST_SEL_X(), (uint32_t)w4.get_DST_SEL_Y(), (uint32_t)w4.get_DST_SEL_Z(), (uint32_t)w4.get_DST_SEL_W()};
     if (s->fmt.depth) sel[0] = 0, sel[1] = 1, sel[2] = 2, sel[3] = 3;  // depth: shaders read .x
     uint64_t key = (uint64_t)(uintptr_t)s->img.image ^ ((uint64_t)type << 56) ^ ((uint64_t)(sel[0] | sel[1] << 4 | sel[2] << 8 | sel[3] << 12) << 40);
+    if (VkImageView* hv = g_views_hot.find(key)) return *hv;
     auto it = g_views.find(key);
-    if (it != g_views.end()) return it->second.view;
+    if (it != g_views.end()) {
+        g_views_hot.put(key, it->second.view);
+        return it->second.view;
+    }
     const Image& img = s->img;
     uint32_t layers = 0;
     switch (type) {
@@ -1237,7 +1992,20 @@ static VkImageView texture_view(Surface* s, VkImageViewType type, uint32_t word4
                 (int)img.type, (int)type);
     }
     g_views[key] = {s->img.image, v};
+    g_views_hot.put(key, v);
     return v;
+}
+
+// guest units -> image pixels of a render target: the image's own size over the guest's. The image
+// size is rounded (vk_surfaces.cpp, create_surface_image), so rscale * ax alone falls short of the
+// edge by a fraction of a pixel: the last column (or row) of widened and half-size targets was
+// never drawn and kept the clear colour or an old picture, which the bloom, blur and occlusion
+// passes then spread into a dark or bluish band along the right and bottom edges of the screen.
+static inline float image_scale_x(const Surface* s) {
+    return s->rscale * s->ax == 1.0f || !s->width ? 1.0f : (float)s->img.width / (float)s->width;
+}
+static inline float image_scale_y(const Surface* s) {
+    return s->rscale * s->ay == 1.0f || !s->height ? 1.0f : (float)s->img.height / (float)s->height;
 }
 
 // ---------------------------------------------------------------- per-stage resources
@@ -1269,6 +2037,7 @@ static Surface* hires_surface(Surface& dst, const Surface* like) {
         s.isDepth = like->isDepth;
         s.fmt = like->fmt;
         s.addr = 0;  // private: never found by address lookups
+        s.sceneScale = true;
         if (!create_surface_image(&s, true)) return nullptr;
         dst = std::move(s);
     }
@@ -1310,7 +2079,124 @@ struct StageTextures {
     VkSampler sampler[LATTE_NUM_MAX_TEX_UNITS];
     float unitScale[LATTE_NUM_MAX_TEX_UNITS];  // by texture unit: resolution scale of the bound surface (x)
     float unitScaleY[LATTE_NUM_MAX_TEX_UNITS]; // ... (y; differs from x for aspect-widened targets)
+    Image* sampled[LATTE_NUM_MAX_TEX_UNITS];   // by binding: the image to prepare for sampling (prepare_sampled)
+    Surface* surf[LATTE_NUM_MAX_TEX_UNITS];    // ... and its surface
+    int count = 0;
 };
+
+// ---------------------------------------------------------------- textures ready before the pass
+// A texture that a draw samples has to be in its shader-read layout, and a layout change can't be
+// recorded inside a render pass: a texture first read in the middle of a pass (a buffer drawn by
+// an earlier pass of the frame, or just used as a copy source) ended that pass, which on a tiled
+// GPU stores every attachment to memory and loads them back for the rest of it (the scene pass,
+// 1598x720 colour + R8 + D32S8 at 1x: ~15 MB each way, 4 times a frame in Outset). The game's frame
+// has the same shape from one frame to the next, so each pass (by its attachments) remembers the
+// textures that ended it, and the next time it begins they are made ready first. Nothing else can
+// write them while the pass is open (they aren't its attachments; copies end passes), so the early
+// layout change is always right; a guess that doesn't come true costs one barrier.
+// WWHD_PASS_PREFETCH=0: off.
+static bool pass_prefetch_on() {
+    static const bool on = !getenv("WWHD_PASS_PREFETCH") || atoi(getenv("WWHD_PASS_PREFETCH")) != 0;
+    return on;
+}
+struct PassRead {
+    uint32_t addr, width, height, format;
+    uint64_t lastFrame;
+};
+static std::unordered_map<uint64_t, std::vector<PassRead>> g_pass_reads;
+static uint64_t g_pass_prefetched = 0, g_pass_splits_seen = 0;
+
+static uint64_t pass_signature(Surface* const* colors, Surface* depth, uint32_t w, uint32_t h) {
+    uint32_t key[11] = {};
+    for (int i = 0; i < 8; i++) key[i] = colors[i] ? colors[i]->addr ^ colors[i]->format << 1 : 0;
+    key[8] = depth ? depth->addr : 0;
+    key[9] = w;
+    key[10] = h;
+    return hash_bytes(key, sizeof key);
+}
+
+// the surface a texture was found as (not a private copy: feedback, mip chain, AO depth)
+static bool primary_surface(const Surface* s) {
+    if (!s || !s->addr) return false;
+    auto range = R.surfaces.equal_range(s->addr);
+    for (auto it = range.first; it != range.second; ++it)
+        if (it->second.get() == s) return true;
+    return false;
+}
+
+// a draw in the open pass is about to sample these: the ones not yet readable will end the pass
+static void note_pass_reads(const StageTextures& t) {
+    if (!R.pass || !pass_prefetch_on()) return;
+    for (int i = 0; i < t.count; i++) {
+        Image* im = t.sampled[i];
+        Surface* s = t.surf[i];
+        if (!im || !s || im != &s->img || im->use == Use::SAMPLED) continue;
+        bool attached = s == R.passDepth;
+        for (int c = 0; c < 8 && !attached; c++) attached = R.passColor[c] == s;
+        if (attached || !primary_surface(s)) continue;
+        auto& v = g_pass_reads[pass_signature(R.passColor, R.passDepth, R.passWidth, R.passHeight)];
+        bool found = false;
+        for (auto& r : v)
+            if (r.addr == s->addr && r.width == s->width && r.height == s->height && r.format == s->format) {
+                r.lastFrame = R.frame;
+                found = true;
+            }
+        if (!found && v.size() < 16) v.push_back({s->addr, s->width, s->height, s->format, R.frame});
+        g_pass_splits_seen++;
+        DLOG("[pass] texture %08X %ux%u first read in the pass (use %d): ready before it next time", s->addr, s->width, s->height,
+             (int)im->use);
+    }
+}
+
+// the pass about to begin: the textures it read last time, in their shader-read layout now
+static void prefetch_pass_reads(Surface* const* colors, Surface* depth, uint32_t w, uint32_t h) {
+    if (!pass_prefetch_on() || g_pass_reads.empty()) return;
+    auto it = g_pass_reads.find(pass_signature(colors, depth, w, h));
+    if (it == g_pass_reads.end()) return;
+    auto& v = it->second;
+    for (size_t k = 0; k < v.size();) {
+        PassRead& r = v[k];
+        if (R.frame - r.lastFrame > 120) {  // not read there for 4 s: forgotten
+            v[k] = v.back();
+            v.pop_back();
+            continue;
+        }
+        k++;
+        auto range = R.surfaces.equal_range(r.addr);
+        for (auto si = range.first; si != range.second; ++si) {
+            Surface* s = si->second.get();
+            if (s->width != r.width || s->height != r.height || s->format != r.format || !s->img.image) continue;
+            if (s->img.use == Use::SAMPLED || s == depth) continue;
+            bool attached = false;
+            for (int c = 0; c < 8 && !attached; c++) attached = colors[c] == s;
+            if (attached) continue;
+            prepare(s->img, Use::SAMPLED);
+            g_pass_prefetched++;
+        }
+    }
+}
+
+// Every sampled image goes to its shader-read layout once all textures of the draw are resolved:
+// resolving one texture can copy from another one already resolved (a surface at the same address
+// in another format, a feedback copy), which leaves that one in TRANSFER_SRC while its descriptor
+// says SHADER_READ_ONLY (found by the validation layer).
+static void prepare_sampled(StageTextures& t) {
+    for (int i = 0; i < t.count; i++)
+        if (t.sampled[i]) prepare(*t.sampled[i], Use::SAMPLED);
+}
+
+// Linear filtering where the format supports it (depth formats often don't: D32_SFLOAT on the Adreno
+// 640 with Qualcomm's driver v502; found by the validation layer)
+static bool filters_linear(VkFormat f) {
+    static std::unordered_map<uint32_t, bool> known;  // render thread
+    auto it = known.find((uint32_t)f);
+    if (it != known.end()) return it->second;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(R.pd, f, &fp);
+    bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    if (!ok) LOG("[gfx] format %d can't be filtered linearly: its textures are point sampled", (int)f);
+    return known.emplace((uint32_t)f, ok).first->second;
+}
 
 static void resolve_textures(const uint32_t* regs, Shader* sh, bool vertex, Surface* const* colors, Surface* depth, StageTextures& out) {
     LatteDecompilerShader* dec = sh->dec;
@@ -1318,9 +2204,12 @@ static void resolve_textures(const uint32_t* regs, Shader* sh, bool vertex, Surf
     uint32_t texBase = vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
     uint32_t samplerBase = vertex ? SAMPLER_BASE_INDEX_VERTEX : SAMPLER_BASE_INDEX_PIXEL;
     for (int u = 0; u < LATTE_NUM_MAX_TEX_UNITS; u++) out.unitScale[u] = out.unitScaleY[u] = 1.0f;
+    out.count = rm.getTextureCount();
     for (sint32 i = 0; i < rm.getTextureCount(); i++) {
         out.view[i] = VK_NULL_HANDLE;
         out.sampler[i] = VK_NULL_HANDLE;
+        out.sampled[i] = nullptr;
+        out.surf[i] = nullptr;
         sint32 unit = rm.getRelativeTextureUnitFromRelativeBindingPoint(i);
         if (unit < 0) continue;
         VkImageViewType type = shader_view_type(dec->textureUnitDim[unit]);
@@ -1343,9 +2232,10 @@ static void resolve_textures(const uint32_t* regs, Shader* sh, bool vertex, Surf
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (std::min<uint32_t>(samplerIdx, 17) + samplerBase) * 3 + 1],
              regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (std::min<uint32_t>(samplerIdx, 17) + samplerBase) * 3 + 2]);
         if (v) {
-            prepare(s->img, Use::SAMPLED);
-            out.unitScale[unit] = s->rscale * s->ax;
-            out.unitScaleY[unit] = s->rscale * s->ay;
+            out.sampled[i] = &s->img;  // prepared once the draw's textures are all resolved (prepare_sampled)
+            out.surf[i] = s;
+            out.unitScale[unit] = image_scale_x(s);
+            out.unitScaleY[unit] = image_scale_y(s);
         }
         else v = null_texture(type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && !R.features.imageCubeArray ? VK_IMAGE_VIEW_TYPE_CUBE : type);
         out.view[i] = v;
@@ -1361,19 +2251,28 @@ static void resolve_textures(const uint32_t* regs, Shader* sh, bool vertex, Surf
             patched[0] = (patched[0] & ~0x7E00u) | (1u << 9) | (1u << 12);  // XY mag/min filter: bilinear
             sw = patched;
         }
-        out.sampler[i] = get_sampler(sw, s && !s->gpuWritten && s->mips > 1);
+        // compare samplers (shadow maps) filter depth by the compare feature, not this one
+        LATTE_SQ_TEX_SAMPLER_WORD0_0 sw0;
+        memcpy(&sw0, &sw[0], 4);
+        const bool nearestOnly = v && s && (uint32_t)sw0.get_DEPTH_COMPARE_FUNCTION() == 0 && !filters_linear(s->img.format);
+        out.sampler[i] = get_sampler(sw, s && !s->gpuWritten && s->mips > 1, nearestOnly);
     }
 }
 
 // Descriptor sets for shaders with dynamic uniform buffers, kept across draws and frames. Everything
 // they reference (image views, samplers, transient buffers) lives as long as the renderer.
 static std::unordered_map<uint64_t, VkDescriptorSet> g_set_cache;
+static HotCache<VkDescriptorSet, 1024> g_set_hot;  // the frame's sets first; cleared with g_set_cache
 static uint64_t g_set_cache_epoch = 0;  // bumped when cached sets are dropped (bind_stage's last-set check)
 static std::vector<VkDescriptorPool> g_set_pools;
 
 static VkDescriptorSet cached_descriptor_set(uint64_t key, VkDescriptorSetLayout dsl, VkWriteDescriptorSet* writes, uint32_t nw) {
+    if (VkDescriptorSet* hs = g_set_hot.find(key)) return *hs;
     auto it = g_set_cache.find(key);
-    if (it != g_set_cache.end()) return it->second;
+    if (it != g_set_cache.end()) {
+        g_set_hot.put(key, it->second);
+        return it->second;
+    }
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (int attempt = 0; attempt < 2 && !set; attempt++) {
         if (!g_set_pools.empty()) {
@@ -1398,6 +2297,7 @@ static VkDescriptorSet cached_descriptor_set(uint64_t key, VkDescriptorSetLayout
     for (uint32_t i = 0; i < nw; i++) writes[i].dstSet = set;
     vkUpdateDescriptorSets(R.device, nw, writes, 0, nullptr);
     g_set_cache[key] = set;
+    g_set_hot.put(key, set);
     return set;
 }
 
@@ -1405,29 +2305,38 @@ static VkDescriptorSet cached_descriptor_set(uint64_t key, VkDescriptorSetLayout
 // forget everything that refers to the old image and free it once the GPU is done with it.
 // Framebuffers and cached descriptor sets are dropped wholesale (rare); the sets stay allocated
 // in their pool until the next trim.
-void retire_image(const Image& old) {
+void retire_image(const Image& old) { retire_images({old}); }
+
+void retire_images(const std::vector<Image>& olds) {
+    if (olds.empty()) return;
     end_pass();
     std::vector<VkImageView> views;
-    for (VkImageView v : old.attachViews)
-        if (v) views.push_back(v);
+    std::unordered_set<VkImage> images;
+    for (const Image& old : olds) {
+        images.insert(old.image);
+        for (VkImageView v : old.attachViews)
+            if (v) views.push_back(v);
+    }
     for (auto it = g_views.begin(); it != g_views.end();) {
-        if (it->second.image == old.image) {
+        if (images.count(it->second.image)) {
             if (it->second.view) views.push_back(it->second.view);
             it = g_views.erase(it);
         } else {
             ++it;
         }
     }
+    g_views_hot.clear();
     std::vector<VkFramebuffer> fbs;
     for (auto& [k, fb] : g_framebuffers) fbs.push_back(fb);
     g_framebuffers.clear();
     g_set_cache.clear();
+    g_set_hot.clear();
     g_set_cache_epoch++;
-    Image img = old;
-    on_complete([img, views, fbs] {
+    std::vector<Image> imgs = olds;
+    on_complete([imgs, views, fbs] {
         for (VkFramebuffer fb : fbs) vkDestroyFramebuffer(R.device, fb, nullptr);
         for (VkImageView v : views) vkDestroyImageView(R.device, v, nullptr);
-        vmaDestroyImage(R.vma, img.image, img.alloc);
+        for (const Image& img : imgs) vmaDestroyImage(R.vma, img.image, img.alloc);
     });
 }
 
@@ -1437,6 +2346,7 @@ void descriptor_cache_trim() {
     wait_idle();
     for (VkDescriptorPool p : g_set_pools) vkResetDescriptorPool(R.device, p, 0);
     g_set_cache.clear();
+    g_set_hot.clear();
     g_set_cache_epoch++;
     LOG("[gfx] descriptor set cache reset");
 }
@@ -1478,8 +2388,12 @@ static void bind_stage(VkCommandBuffer cmd, VkPipelineLayout layout, const uint3
         uint32_t size = sh->varsRange;
         Upload u = upload_alloc(size, uboAlign);
         g_bytes_vars += size;
-        memset(u.ptr, 0, size);
-        float* f = (float*)u.ptr;
+        // assembled in cached memory, then copied in one go: clearing the upload memory (uncached on
+        // some GPUs, e.g. Adreno) and writing it in scattered 16-byte pieces cost ~4% of the render thread
+        static thread_local std::vector<uint8_t> vars;
+        if (vars.size() < size) vars.resize(size);
+        memset(vars.data(), 0, size);
+        float* f = (float*)vars.data();
         auto at = [&](sint32 loc) { return f + loc / 4; };
         if (dec->uniform.loc_alphaTestRef >= 0) {
             LATTE_SX_ALPHA_REF ref;
@@ -1507,6 +2421,11 @@ static void bind_stage(VkCommandBuffer cmd, VkPipelineLayout layout, const uint3
             // for a 640x360 grid; the pass draws 960x540, so tile the 4x4 noise per output pixel instead
             if (vertex && ao_mode() == 2 && (regs[mmSQ_PGM_START_VS] << 8) == 0x44BDF900)
                 ((float*)dst)[3] *= 1.5f;
+            // bloom strength: the extract shader's intensity (remapped[2].z)
+            const int bloom = g_bloom_pct.load(std::memory_order_relaxed);
+            if (!vertex && bloom != 100 && (regs[mmSQ_PGM_START_PS] << 8) == 0x44F91200 &&
+                (uint32_t)dec->uniform.loc_remapped + 2 * 16 + 3 * 4 <= size)
+                ((float*)dst)[2 * 4 + 2] *= bloom / 100.0f;
         }
         if (dec->uniform.loc_uniformRegister >= 0)
             memcpy(at(dec->uniform.loc_uniformRegister), &regs[aluBase], dec->uniform.count_uniformRegister * 16);
@@ -1530,6 +2449,7 @@ static void bind_stage(VkCommandBuffer cmd, VkPipelineLayout layout, const uint3
             at(e.uniformLocation)[0] = known ? tex.unitScale[e.texUnit] : 1.0f;
             at(e.uniformLocation)[1] = known ? tex.unitScaleY[e.texUnit] : 1.0f;
         }
+        memcpy(u.ptr, vars.data(), size);
         buffers[nb] = {u.buf, dyn ? 0 : u.offset, size};
         if (dyn) dynOffsets[nd++] = {(uint32_t)rm.uniformVarsBufferBindingPoint, (uint32_t)u.offset};
         write((uint32_t)rm.uniformVarsBufferBindingPoint, uboType, nullptr, &buffers[nb++]);
@@ -1553,13 +2473,13 @@ static void bind_stage(VkCommandBuffer cmd, VkPipelineLayout layout, const uint3
             size = std::min(size, p);
         }
         static SubmissionCopies blocks;
+        // Uniform blocks are compared, not reused by write tracking (as the official renderer's
+        // uniform snapshots do): the game rewrites some (0x800-byte light/shadow blocks) without
+        // the flush the tracking relies on, and a stale copy drew the shadows with another frame's
+        // matrices. They are small (~100 KiB a frame). WWHD_TRACK_UBO_WRITES=1: the tracking again.
+        static const bool trackUbo = g_track_writes && getenv("WWHD_TRACK_UBO_WRITES") != nullptr;
         Upload u;
         if (addr && addr + (uint64_t)size <= 0x100000000ull) {
-            // Uniform blocks are compared, not reused by write tracking (as the original project's
-            // uniform snapshots do): the game rewrites some (0x800-byte light/shadow blocks) without the
-            // flush the tracking relies on, and a stale copy drew the shadows with another frame's
-            // matrices (fix from the PR's commit 4832d83). WWHD_TRACK_UBO_WRITES=1: the tracking again.
-            static const bool trackUbo = g_track_writes && getenv("WWHD_TRACK_UBO_WRITES") != nullptr;
             u = trackUbo ? copy_tracked(blocks, addr, size, uboAlign, g_bytes_ubo, g_bytes_ubo_reused)
                                : copy_deduped(blocks, mem::ptr(addr), addr, size, uboAlign, g_bytes_ubo, g_bytes_ubo_reused);
         } else {
@@ -1641,6 +2561,27 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         if (same) return true;
     }
     end_pass();
+    prefetch_pass_reads(colors, depth, w, h);
+    // deferred clears of the layers this pass renders to: done by the pass as it begins (the whole
+    // render area is the whole layer; a larger depth buffer is cleared the usual way)
+    uint32_t clears = 0;
+    VkClearValue clearValues[9] = {};
+    {
+        uint32_t k = 0;
+        auto take = [&](Image& img, uint32_t layer, uint32_t bit, bool depthAtt) {
+            if (layer >= 32 || !(img.pendingClearLayers >> layer & 1) || img.width != w || img.height != h) return;
+            img.pendingClearLayers &= ~(1u << layer);
+            clearValues[k] = img.pendingClearValue;
+            if (!depthAtt) clears |= 1u << bit;
+            else {
+                if (img.pendingClearAspect & VK_IMAGE_ASPECT_DEPTH_BIT) clears |= 1u << 8;
+                if (img.pendingClearAspect & VK_IMAGE_ASPECT_STENCIL_BIT) clears |= 1u << 9;
+            }
+        };
+        for (int i = 0; i < 8; i++)
+            if (colors[i]) take(colors[i]->img, colorSlices[i], i, false), k++;
+        if (depth) take(depth->img, depthSlice, 8, true);
+    }
     for (int i = 0; i < 8; i++)
         if (colors[i]) prepare(colors[i]->img, Use::COLOR);
     if (depth) prepare(depth->img, Use::DEPTH);
@@ -1660,11 +2601,15 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
         mark_gpu_written(depth);
     }
     if (!n) return false;
-    VkRenderPass rp = get_render_pass(pf);
+    VkRenderPass compatible = get_render_pass(pf), rp = clears ? get_render_pass(pf, clears) : compatible;
     VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = rp;
-    bi.framebuffer = get_framebuffer(rp, views, n, w, h);
+    bi.framebuffer = get_framebuffer(compatible, views, n, w, h);
     bi.renderArea = {{0, 0}, {w, h}};
+    if (clears) {
+        bi.clearValueCount = n;
+        bi.pClearValues = clearValues;
+    }
     VkCommandBuffer cb = command_buffer();
     {
         VkFormat cf[8];
@@ -1673,6 +2618,8 @@ static bool ensure_pass(Surface* const* colors, const uint32_t* colorSlices, Sur
             if (pf.color[i]) cf[nc++] = (VkFormat)pf.color[i];
         prof_pass_begin(w, h, cf, nc, (VkFormat)pf.depth);
     }
+    DLOG("[pass] begin %ux%u: %u attachments, clears %03X, colour %08X depth %08X", w, h, n, clears, colors[0] ? colors[0]->addr : 0,
+         depth ? depth->addr : 0);
     vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     // Dynamic state and bindings recorded from here on are tracked again. Not valid until the first
     // draw has set all of it: Vulkan keeps the previous pass's values within a command buffer (and
@@ -1762,7 +2709,7 @@ struct DrawIndices {
 static uint64_t g_index_reused, g_index_built;
 static bool draw_indices(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, DrawIndices& out) {
     struct Entry { DrawIndices d; uint32_t prim, indexType, gen; };
-    static std::unordered_map<uint64_t, Entry> cache;
+    static FlatTable<Entry> cache;
     static uint64_t serial = ~0ull;
     static std::vector<uint32_t> tmp;  // render thread; storage reused across draws
     command_buffer();
@@ -1774,11 +2721,10 @@ static bool draw_indices(uint32_t prim, uint32_t count, uint32_t indexType, uint
     const bool cacheable = indexAddr && g_track_writes && indexAddr + (uint64_t)bytes <= 0x100000000ull;
     const uint64_t key = (uint64_t)indexAddr << 32 | count;
     if (cacheable) {
-        auto it = cache.find(key);
-        if (it != cache.end() && it->second.prim == prim && it->second.indexType == indexType &&
-            memw::unchanged_since(indexAddr, bytes, it->second.gen)) {
+        Entry* it = cache.find(key);
+        if (it && it->prim == prim && it->indexType == indexType && memw::unchanged_since(indexAddr, bytes, it->gen)) {
             g_index_reused++;
-            out = it->second.d;
+            out = it->d;
             return true;
         }
     }
@@ -1801,7 +2747,6 @@ static bool draw_indices(uint32_t prim, uint32_t count, uint32_t indexType, uint
 namespace {
 constexpr uint32_t kRecShader = 1, kRecPipelineVk = 4;
 FILE* g_cache_out = nullptr;
-bool g_cache_replaying = false;
 bool g_cache_disabled = false;
 
 struct PipelineRecipe {
@@ -1874,6 +2819,7 @@ static void cache_record_shader(const uint32_t* regs, bool vertex) {
 
 static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, uint64_t fsKey, const PipelineState& st) {
     if (g_cache_replaying || !g_cache_out) return;
+    if (hud_cov_slot(st)) return;  // made from the module at draw time (coverage_module), never replayed
     PipelineRecipe r{};
     r.vsKey = vs->key;
     r.psKey = ps->key;
@@ -1885,20 +2831,116 @@ static void cache_record_pipeline(const uint32_t* regs, Shader* vs, Shader* ps, 
     cache_write(kRecPipelineVk, v);
 }
 
+// progress of cache_load for the app's loading screen (cache_progress): 0 not started, 1 loading,
+// 2 done, 3 building the cached pipelines; bytes of the file read and its size (pipelines built and
+// queued in state 3); shader variants prepared
+static std::atomic<int> g_cache_state{0};
+static std::atomic<uint64_t> g_cache_done{0}, g_cache_total{0}, g_cache_shaders{0};
+void cache_progress(uint64_t out[4]) {
+    out[0] = (uint64_t)g_cache_state.load();
+    out[1] = g_cache_done.load();
+    out[2] = g_cache_total.load();
+    out[3] = g_cache_shaders.load();
+}
+
+static void prebuild_pipelines();
+
+// After the replay: the pipeline recipes name their shaders by the keys they had when recorded
+// (before unused texture units and, for pixel shaders, the vertex semantics were left out of the
+// key): renamed to the shaders' keys now, repeats dropped. The file only grew (335 MB, 300k shader
+// variants after some hours: ~25 s of translation at every start and hundreds of MB): when most of
+// its shader records aren't needed it is rewritten with those a pipeline recipe uses, one per
+// distinct translation (so every module is compiled ahead), and the renamed recipes. A variant
+// left out takes its translation through shaderkeys when a draw needs it.
+struct CacheRecord { long at; uint32_t len; Shader* shader; };
+static void cache_compact(const std::string& path, FILE* f, const std::vector<CacheRecord>& records, size_t shaderRecords) {
+    auto resolve = [](uint64_t k) -> Shader* {
+        auto it = g_shaders.find(k);
+        if (it != g_shaders.end()) return it->second;
+        auto a = g_key_alias.find(k);
+        return a != g_key_alias.end() ? a->second : nullptr;
+    };
+    const size_t recipesBefore = g_pending_pipelines.size();
+    std::unordered_set<uint64_t> seen;
+    std::vector<PipelineRecipe> recipes;
+    recipes.reserve(g_pending_pipelines.size());
+    for (PipelineRecipe r : g_pending_pipelines) {
+        Shader* vs = resolve(r.vsKey);
+        Shader* ps = resolve(r.psKey);
+        if (!vs || !ps) continue;
+        r.vsKey = vs->key;
+        r.psKey = ps->key;
+        if (seen.insert(hash_bytes(&r, sizeof r, 0x5045)).second) recipes.push_back(r);
+    }
+    g_pending_pipelines.swap(recipes);
+    std::unordered_map<uint64_t, Shader*>().swap(g_key_alias);
+    std::unordered_set<const Shader*> used;
+    for (const PipelineRecipe& r : g_pending_pipelines) {
+        used.insert(g_shaders[r.vsKey]);
+        used.insert(g_shaders[r.psKey]);
+    }
+    std::unordered_set<const void*> covered;  // translations (Shader::canon) with a record kept
+    for (const CacheRecord& r : records)
+        if (used.count(r.shader) && r.shader->canon) covered.insert((const void*)(uintptr_t)r.shader->canon);
+    std::vector<CacheRecord> keep;
+    for (const CacheRecord& r : records)
+        if (used.count(r.shader) || (r.shader->canon && covered.insert((const void*)(uintptr_t)r.shader->canon).second))
+            keep.push_back(r);
+    if (shaderRecords < 8192 || shaderRecords < 2 * keep.size()) return;
+    const double t0 = now_ms();
+    std::string tmp = path + ".tmp";
+    FILE* o = fopen(tmp.c_str(), "wb");
+    if (!o) return;
+    bool ok = true;
+    std::vector<uint8_t> buf;
+    for (const CacheRecord& r : keep) {
+        buf.resize(r.len);
+        ok = ok && fseek(f, r.at, SEEK_SET) == 0 && fread(buf.data(), 1, r.len, f) == r.len && fwrite(buf.data(), 1, r.len, o) == r.len;
+    }
+    for (const PipelineRecipe& r : g_pending_pipelines) {
+        std::vector<uint8_t> raw;
+        put(raw, r);
+        uLongf csize = compressBound(raw.size());
+        std::vector<uint8_t> comp(csize);
+        if (compress2(comp.data(), &csize, raw.data(), raw.size(), 6) != Z_OK) continue;
+        uint32_t hdr[3] = {kRecPipelineVk, (uint32_t)raw.size(), (uint32_t)csize};
+        ok = ok && fwrite(hdr, sizeof hdr, 1, o) == 1 && fwrite(comp.data(), 1, csize, o) == csize;
+    }
+    ok = fclose(o) == 0 && ok;
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        LOG("[gfx] shader cache: compacting failed");
+        return;
+    }
+    LOG("[gfx] shader cache compacted: %zu of %zu shader records, %zu of %zu pipeline recipes kept (%.0f ms)", keep.size(),
+        shaderRecords, g_pending_pipelines.size(), recipesBefore, now_ms() - t0);
+}
+
 // load and replay the recipes; runs once on the render thread before the first draw
 static void cache_load() {
+    struct Done { ~Done() { g_cache_state = 2; } } done;  // on every way out
+    g_cache_state = 1;
     std::string path = cache_path();
     if (path == "0") { g_cache_disabled = true; return; }
     size_t slash = path.find_last_of('/');
     spirv_cache_open(slash == std::string::npos ? std::string(".") : path.substr(0, slash));
+    key_canon_open(slash == std::string::npos ? std::string(".") : path.substr(0, slash));
     double t0 = now_ms();
     size_t shaders = 0, pipelines = 0;
     if (FILE* f = fopen(path.c_str(), "rb")) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long size = ftell(f);
+            if (size > 0) g_cache_total = (uint64_t)size;
+            rewind(f);
+        }
         static std::vector<uint32_t> regs(0x10000);
         g_cache_replaying = true;
         g_defer_compiles = true;
         uint32_t hdr[3];
-        while (fread(hdr, sizeof hdr, 1, f) == 1) {
+        // the shader records that made a new shader (the rest repeat one): what a compacted file keeps
+        std::vector<CacheRecord> keep;
+        size_t shaderRecords = 0;
+        for (long at = ftell(f); fread(hdr, sizeof hdr, 1, f) == 1; at = ftell(f)) {
             std::vector<uint8_t> comp(hdr[2]), raw(hdr[1]);
             if (fread(comp.data(), 1, hdr[2], f) != hdr[2]) break;
             uLongf rsize = hdr[1];
@@ -1936,7 +2978,12 @@ static void cache_load() {
             // or a record whose program has the size of the previous one would get its hash (and
             // the previous program's key: a wrong shader for a live draw, e.g. a black sky)
             g_program_hashes.erase(prog);
-            if (fsSize) g_program_hashes.erase(fsProg);
+            program_hot(prog).addr = 0;
+            g_fetch_last.frame = ~0ull;
+            if (fsSize) {
+                g_program_hashes.erase(fsProg);
+                program_hot(fsProg).addr = 0;
+            }
             std::fill(regs.begin(), regs.end(), 0);
             for (uint32_t i = 0; i < n; i++) {
                 uint32_t r, val;
@@ -1950,12 +2997,21 @@ static void cache_load() {
             uint64_t fsKey = 0;
             LatteFetchShader* fs = vertex ? get_fetch_shader(regs.data(), &fsKey) : nullptr;
             if (vertex && !fs) continue;
-            get_shader_uncached(regs.data(), vertex, fs, fsKey);
+            const size_t known = g_shaders.size();
+            Shader* made = get_shader_uncached(regs.data(), vertex, fs, fsKey);
+            shaderRecords++;
+            if (g_shaders.size() != known && made) keep.push_back({at, (uint32_t)sizeof hdr + hdr[2], made});
             shaders++;
+            if ((shaders & 255) == 0) {
+                g_cache_shaders = shaders;
+                long at = ftell(f);
+                if (at > 0) g_cache_done = (uint64_t)at;
+            }
         }
-        fclose(f);
         g_cache_replaying = false;
         g_defer_compiles = false;
+        cache_compact(path, f, keep, shaderRecords);
+        fclose(f);
     }
     void headstart_load();  // gfx/shader_headstart.cpp
     headstart_load();
@@ -1963,6 +3019,7 @@ static void cache_load() {
     if (shaders || pipelines)
         LOG("[gfx] shader cache: replayed %zu shaders, %zu pipelines queued (%.0f ms) from %s", shaders, pipelines,
             now_ms() - t0, path.c_str());
+    prebuild_pipelines();
 }
 
 // build queued pipelines whose shaders have finished compiling, at most `budget` of them and only
@@ -2008,15 +3065,64 @@ static void build_pending_pipelines(int budget, int maxInFlight) {
     g_cache_replaying = false;
 }
 
+// Every cached pipeline (and its shaders) built before the first frame, behind the loading screen,
+// instead of a few per frame while playing: built in the background, a pipeline the game needed
+// before its turn came was waited for or its draws skipped (hitches and pop-in for the first minutes,
+// with tens of thousands queued), and the compiles kept the CPU busy (heat) during play. With a warm
+// driver cache (the pipeline cache file) this takes seconds. WWHD_SHADERS_AT_START=0 leaves them to
+// the background as before; it gives up after WWHD_SHADERS_AT_START_S seconds (default 300), the
+// rest then built in the background.
+static void prebuild_pipelines() {
+    const char* e = getenv("WWHD_SHADERS_AT_START");
+    if ((e && atoi(e) == 0) || (g_pending_pipelines.empty() && g_deferred_modules.empty()) || g_sync_shaders) return;
+    const double limitMs = 1000.0 * (getenv("WWHD_SHADERS_AT_START_S") ? atof(getenv("WWHD_SHADERS_AT_START_S")) : 300.0);
+    const size_t total = g_pending_pipelines.size(), builtBefore = g_recipes_built;
+    const double t0 = now_ms();
+    g_cache_done = 0;
+    g_cache_total = total;
+    g_cache_state = 3;
+    constexpr int kInFlight = 64;  // the workers' queue: enough to keep every compile thread busy
+    while (!g_pending_pipelines.empty() && now_ms() - t0 < limitMs) {
+        size_t before = g_pending_pipelines.size();
+        build_pending_pipelines(INT_MAX, kInFlight);
+        g_cache_done = total - g_pending_pipelines.size();
+        g_cache_shaders = g_recipes_built - builtBefore;
+        if (g_pending_pipelines.size() == before || g_compiles_in_flight >= kInFlight) {
+            // waiting for shader compiles (or a full queue): wake when one finishes
+            std::unique_lock<std::mutex> lk(g_compile_m);
+            g_compile_cv.wait_for(lk, std::chrono::milliseconds(5));
+        }
+    }
+    // the cached shaders no pipeline recipe uses (yet)
+    while (!g_deferred_modules.empty() && now_ms() - t0 < limitMs) {
+        if (g_compiles_in_flight >= kInFlight) {
+            std::unique_lock<std::mutex> lk(g_compile_m);
+            g_compile_cv.wait_for(lk, std::chrono::milliseconds(5));
+            continue;
+        }
+        Module* m = g_deferred_modules.back();
+        g_deferred_modules.pop_back();
+        start_module(m);
+    }
+    // the last compiles
+    while (g_compiles_in_flight > 0 && now_ms() - t0 < limitMs) {
+        std::unique_lock<std::mutex> lk(g_compile_m);
+        g_compile_cv.wait_for(lk, std::chrono::milliseconds(5));
+    }
+    LOG("[gfx] cached pipelines built before the first frame: %zu of %zu (%zu unresolved) in %.0f ms%s",
+        g_recipes_built - builtBefore, total, g_recipes_dropped, now_ms() - t0,
+        g_pending_pipelines.empty() ? "" : "; the rest in the background");
+}
+
 // build cached pipelines whose shaders have finished compiling; a few per frame
 void cache_warm_step() {
     // a few background compiles per frame keep the startup burst from starving the game, and none
     // start while the game's own compiles keep the compiler busy (WWHD_BG_COMPILES, default 4 in flight)
     static const int maxInFlight = getenv("WWHD_BG_COMPILES") ? atoi(getenv("WWHD_BG_COMPILES")) : 4;
-    for (int n = 0; n < 8 && !g_deferred_shaders.empty() && g_compiles_in_flight < maxInFlight;) {
-        Shader* s = g_deferred_shaders.back();
-        g_deferred_shaders.pop_back();
-        if (s->state == CS_DEFERRED) { compile_deferred(s); n++; }
+    for (int n = 0; n < 8 && !g_deferred_modules.empty() && g_compiles_in_flight < maxInFlight;) {
+        Module* m = g_deferred_modules.back();
+        g_deferred_modules.pop_back();
+        if (m->state == CS_DEFERRED) { start_module(m); n++; }
     }
     static bool queued = false;
     if (!g_pending_pipelines.empty()) queued = true;
@@ -2029,29 +3135,55 @@ void cache_warm_step() {
 }
 
 enum Skip { SK_GS, SK_RASTER_KILL, SK_NO_FETCH, SK_NO_SHADER, SK_NO_TARGET, SK_PRIM, SK_PASS, SK_PIPELINE, SK_CULL, SK_SCISSOR, SK_COMPILING,
-            SK_DROPPED_DEPTH, SK_DROPPED_COLOR, SK_PIPE_COMPILING, SK_COUNT };
+            SK_DROPPED_DEPTH, SK_DROPPED_COLOR, SK_PIPE_COMPILING, SK_HIDDEN_DRC, SK_FAR_SHADOW, SK_COUNT };
 static uint64_t g_skip[SK_COUNT];
 static const char* kSkipNames[SK_COUNT] = {"geometry-shader", "raster-kill", "no-fetch-shader", "shader-failed", "no-target",
                                            "unsupported-prim", "no-pass", "pipeline-failed", "cull-all", "empty-scissor",
-                                           "compiling", "dropped-depth", "dropped-color", "pipeline-compiling"};
+                                           "compiling", "dropped-depth", "dropped-color", "pipeline-compiling", "hidden-gamepad", "far-shadow"};
+// test aid: WWHD_HITCH_MS=n logs render-thread frames that took n ms or more between swaps, with
+// what the render thread spent on shader translation, waits for compiles and the cache warm-up
+void hitch_report(double frameMs, double warmMs) {
+    static const double thr = getenv("WWHD_HITCH_MS") ? atof(getenv("WWHD_HITCH_MS")) : 0;
+    static double lastDec = 0, lastWait = 0;
+    static size_t lastShaders = 0, lastPipes = 0;
+    const double wait = g_waited_ms[0] + g_waited_ms[1] + g_waited_ms[2];
+    const double dec = g_t_decompile - lastDec, waited = wait - lastWait;
+    const size_t shaders = g_shaders.size() - lastShaders, pipes = g_pipelines.size() - lastPipes;
+    lastDec = g_t_decompile;
+    lastWait = wait;
+    lastShaders = g_shaders.size();
+    lastPipes = g_pipelines.size();
+    if (thr > 0 && frameMs >= thr)
+        LOG("[hitch] frame %llu: %.1f ms between swaps; shader translation %.1f ms (%zu new shaders), compile waits %.1f ms, "
+            "%zu new pipelines, cache warm-up %.1f ms", (unsigned long long)R.frame, frameMs, dec, shaders, waited, pipes, warmMs);
+}
+
+namespace rec { void report_op_counts(); }  // vk_record.cpp
 void report_skips() {
+    rec::report_op_counts();
     char buf[512];
     int n = 0;
     for (int i = 0; i < SK_COUNT; i++)
         if (g_skip[i]) n += snprintf(buf + n, sizeof buf - n, " %s=%llu", kSkipNames[i], (unsigned long long)g_skip[i]);
     if (n) LOG("[gfx] skipped draws:%s", buf);
+    if (g_pass_prefetched || g_pass_splits_seen) {
+        LOG("[gfx] textures made ready before their pass: %llu; pass splits by a first read: %llu", (unsigned long long)g_pass_prefetched,
+            (unsigned long long)g_pass_splits_seen);
+        g_pass_prefetched = g_pass_splits_seen = 0;
+    }
     if (g_waited_n[0] + g_waited_n[1] + g_waited_n[2])
         LOG("[gfx] waited for compiles (policy %d): recent targets %llu draws %.0f ms, intermittent %llu draws %.0f ms, "
             "new targets %llu draws %.0f ms", g_wait_policy, (unsigned long long)g_waited_n[0], g_waited_ms[0],
             (unsigned long long)g_waited_n[1], g_waited_ms[1], (unsigned long long)g_waited_n[2], g_waited_ms[2]);
-    LOG("[gfx] %zu shaders (%zu distinct modules, %zu SPIR-V from disk), %zu pipelines; ms decompile %.0f, spirv %.0f, pipeline %.0f",
-        g_shaders.size(), g_modules.size(), g_spv_disk_hits, g_pipelines.size(), g_t_decompile, g_t_spirv_us / 1000.0,
+    LOG("[gfx] %zu shaders (%zu reusing a translation, %zu distinct modules, %zu SPIR-V from disk), %zu pipelines; ms decompile %.0f, spirv %.0f, pipeline %.0f",
+        g_shaders.size(), g_shaders_reused, g_modules.size(), g_spv_disk_hits, g_pipelines.size(), g_t_decompile, g_t_spirv_us / 1000.0,
         g_t_pipeline_us / 1000.0);
-    extern uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
-    LOG("[gfx] last 300 frames: %llu full texture checks, %llu uploads, %llu invalidates marking %llu surfaces",
+    extern uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces, g_stat_texture_stale;
+    LOG("[gfx] last 300 frames: %llu full texture checks, %llu uploads, %llu invalidates marking %llu surfaces; %llu texture "
+        "changes the write tracking missed",
         (unsigned long long)g_stat_full_checks, (unsigned long long)g_stat_uploads, (unsigned long long)g_stat_invalidates,
-        (unsigned long long)g_stat_invalidated_surfaces);
-    g_stat_full_checks = g_stat_uploads = g_stat_invalidates = g_stat_invalidated_surfaces = 0;
+        (unsigned long long)g_stat_invalidated_surfaces, (unsigned long long)g_stat_texture_stale);
+    g_stat_full_checks = g_stat_uploads = g_stat_invalidates = g_stat_invalidated_surfaces = g_stat_texture_stale = 0;
     LOG("[gfx] last 300 frames, KiB/frame copied: vertices %.0f (+%.0f large, once per submission; %.0f reused), uniform blocks %.0f "
         "(%.0f reused), uniform vars %.0f",
         g_bytes_vtx / 300.0 / 1024, g_bytes_vtx_shared / 300.0 / 1024, g_bytes_vtx_reused / 300.0 / 1024, g_bytes_ubo / 300.0 / 1024,
@@ -2060,6 +3192,11 @@ void report_skips() {
     LOG("[gfx] last 300 frames, draws/frame: %.0f with state reused, %.0f resolved; indices %.0f reused, %.0f built",
         g_fast_draws / 300.0, g_slow_draws / 300.0, g_index_reused / 300.0, g_index_built / 300.0);
     g_index_reused = g_index_built = 0;
+    LOG("[gfx] last 300 frames, program hashes/frame: %.0f looked up, %.0f from the map (%zu addresses); %llu changed unannounced",
+        g_program_lookups / 300.0, g_program_map_lookups / 300.0, g_program_hashes.size(), (unsigned long long)g_program_stale);
+    g_program_lookups = g_program_map_lookups = g_program_stale = 0;
+    LOG("[gfx] last 300 frames, shader keys/frame: %.0f looked up, %.0f from the map", g_shader_lookups / 300.0, g_shader_map_lookups / 300.0);
+    g_shader_lookups = g_shader_map_lookups = 0;
     if (g_stale_reuses) LOG("[gfx] write tracking: %llu reuses were outdated (written without a flush)", (unsigned long long)g_stale_reuses);
     g_stale_reuses = 0;
     g_fast_draws = g_slow_draws = 0;
@@ -2068,9 +3205,9 @@ void report_skips() {
 // ---------------------------------------------------------------- vertex data
 // Guest vertex buffers are copied into transient memory per draw. Large buffers (static meshes) are
 // copied once per submission and shared by the draws in it while the game hasn't written their
-// pages since (mem_writes.h; WWHD_TRACK_WRITES=0: compared instead), as the original project's
-// renderer never reuses a copy on its address alone: a mesh rewritten within a submission (cloth,
-// morphs, a buffer reused for another mesh) drew its old vertices (fix from the PR's 65f0189).
+// pages since (mem_writes.h; WWHD_TRACK_WRITES=0: compared instead), as the official renderer
+// never reuses a copy on its address alone: a mesh rewritten within a submission (cloth, morphs,
+// a buffer reused for another mesh) drew its old vertices.
 static Upload vertex_buffer(uint32_t addr, uint32_t size) {
     struct Shared { Upload u; uint32_t gen; };
     static std::unordered_map<uint64_t, Shared> shared;
@@ -2096,6 +3233,74 @@ static Upload vertex_buffer(uint32_t addr, uint32_t size) {
     Upload u = upload(mem::ptr(addr), size, 16);
     g_bytes_vtx_shared += size;
     shared[key] = {u, gen};
+    return u;
+}
+
+// The attributes of a group decoded on the CPU (vertex_cpu_policy.h, PowerVR), exactly like the
+// shader decoder would (vertex_cpu_decode.h): 16 bytes each, interleaved per element, for every
+// element of the declared buffer (the draw's vertex range isn't known here). A conversion is shared
+// by the draws of a submission while the game hasn't written the buffer since (as vertex_buffer;
+// WWHD_TRACK_WRITES=0: converted again for every draw).
+static Upload cpu_vertex_stream(const LatteParsedFetchShaderBufferGroup& g, uint32_t addr, uint32_t size, uint32_t stride,
+                                uint32_t attributes) {
+    const uint32_t mask = R.vertexCpuClasses;
+    // the group's layout as the stream sees it: which attributes, their formats and offsets
+    uint64_t layout = hash_bytes(&stride, sizeof stride, 0x435055);
+    for (int j = 0; j < g.attribCount; ++j) {
+        const auto& a = g.attrib[j];
+        if (!cpu_vertex_selected(a, mask)) continue;
+        const uint32_t v[5] = {(uint32_t)a.format, a.nfa, a.isSigned, (uint32_t)a.endianSwap, a.offset};
+        layout = hash_bytes(v, sizeof v, layout);
+    }
+    struct Converted { Upload u; uint32_t gen; };
+    static std::unordered_map<uint64_t, Converted> converted;
+    static uint64_t serial = ~0ull;
+    command_buffer();
+    if (R.cmdSerial != serial) {  // transient memory is only valid within one submission
+        converted.clear();
+        serial = R.cmdSerial;
+    }
+    const uint64_t key = hash_bytes(&layout, sizeof layout, (uint64_t)addr << 32 | size);
+    if (g_track_writes) {
+        auto it = converted.find(key);
+        if (it != converted.end() && memw::unchanged_since(addr, size, it->second.gen)) return it->second.u;
+    }
+    uint64_t elements = stride ? ((uint64_t)size + stride - 1) / stride : 1;
+    // a buffer declared far larger than any mesh (a stray size): the elements up to 256 MiB of stream
+    if (elements * attributes * 16 > (256u << 20)) {
+        static int logged = 0;
+        if (logged++ < 4) LOG("[vk] vertex attributes on the CPU: buffer %08X+%X cut to 256 MiB of converted data", addr, size);
+        elements = (256u << 20) / (attributes * 16);
+    }
+    const uint64_t bytes = elements * attributes * 16;
+    const uint32_t gen = memw::now();  // before reading: a write during it makes the next use convert again
+    Upload u = upload_alloc(std::max<VkDeviceSize>(bytes, 16), 16);
+    auto* out = (uint32_t*)u.ptr;
+    const uint8_t* guest = mem::ptr(addr);
+    for (int j = 0; j < g.attribCount; ++j) {
+        const auto& a = g.attrib[j];
+        if (!cpu_vertex_selected(a, mask)) continue;
+        static std::set<uint32_t> unsupported;
+        uint8_t zero[16]{};
+        uint32_t probe[4];
+        const uint32_t id = (uint32_t)a.format | a.nfa << 8 | a.isSigned << 12 | (uint32_t)a.endianSwap << 16;
+        if (!cpu_decode_attribute(a, zero, probe) && unsupported.insert(id).second)
+            LOG("[vk] vertex attributes on the CPU: no decoder for format 0x%02x nfa %u signed %u endian %u (reads as zero, like the shader)",
+                (unsigned)a.format, (unsigned)a.nfa, (unsigned)a.isSigned, (unsigned)a.endianSwap);
+    }
+    for (uint64_t e = 0; e < elements; ++e) {
+        uint32_t slot = 0;
+        for (int j = 0; j < g.attribCount; ++j) {
+            const auto& a = g.attrib[j];
+            if (!cpu_vertex_selected(a, mask)) continue;
+            const uint64_t at = e * stride + a.offset;
+            uint32_t value[4] = {0, 0, 0, 0};
+            if (at + cpu_vertex_bytes(a) <= size) cpu_decode_attribute(a, guest + at, value);
+            memcpy(out + (e * attributes + slot++) * 4, value, 16);
+        }
+    }
+    g_bytes_vtx += bytes;
+    converted[key] = {u, gen};
     return u;
 }
 
@@ -2176,9 +3381,20 @@ static void record_draw(const uint32_t* regs, const Prepared& P, uint32_t prim, 
         memcpy(g_ds.blend, &regs[REGADDR::CB_BLEND_RED], sizeof g_ds.blend);
     }
     float bias[3] = {0, 0, 0};  // constant, clamp, slope
-    if (pm.get_OFFSET_FRONT_ENABLED()) {
-        bias[2] = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]) / 16.0f;
-        bias[0] = gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET]);
+    // Latte has independent polygon offsets for front and back faces. Shadow maps commonly cull
+    // their front faces and render only back faces, so ignoring the back offset removes the bias
+    // entirely and turns self-shadowing into a camera-dependent moire pattern. Vulkan exposes one
+    // bias for the draw; select the state of the face that can actually survive culling.
+    const bool frontBias = pm.get_OFFSET_FRONT_ENABLED();
+    // Disabled by default (the official renderer uses the front offset only); WWHD_BACK_POLY_OFFSET=1 restores it.
+    static const bool backBiasOn = getenv("WWHD_BACK_POLY_OFFSET") != nullptr;
+    const bool backBias = backBiasOn && pm.get_OFFSET_BACK_ENABLED();
+    const bool useBackBias = backBias && (!frontBias || (pm.get_CULL_FRONT() && !pm.get_CULL_BACK()));
+    if (frontBias || backBias) {
+        const uint32_t scaleReg = useBackBias ? REGADDR::PA_SU_POLY_OFFSET_BACK_SCALE : REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE;
+        const uint32_t offsetReg = useBackBias ? REGADDR::PA_SU_POLY_OFFSET_BACK_OFFSET : REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET;
+        bias[2] = gx2::bitsf(regs[scaleReg]) / 16.0f;
+        bias[0] = gx2::bitsf(regs[offsetReg]);
         bias[1] = R.features.depthBiasClamp ? gx2::bitsf(regs[REGADDR::PA_SU_POLY_OFFSET_CLAMP]) : 0.0f;
     }
     if (!g_ds.valid || memcmp(bias, g_ds.bias, sizeof bias) != 0) {
@@ -2211,15 +3427,24 @@ static void record_draw(const uint32_t* regs, const Prepared& P, uint32_t prim, 
         uint32_t addr = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7];
         uint32_t size = regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 1] + 1;
         if (!addr || addr + (uint64_t)size > 0x100000000ull) continue;
-        Upload u = vertex_buffer(addr, size);
-        VkDeviceSize off = u.offset;
-        uint32_t slot = (uint32_t)g.attributeBufferIndex;
-        if (slot < 16 && g_ds.valid && g_ds.vb[slot] == u.buf && g_ds.vbOffset[slot] == off) continue;
-        vkCmdBindVertexBuffers(cmd, slot, 1, &u.buf, &off);
-        if (slot < 16) {
-            g_ds.vb[slot] = u.buf;
-            g_ds.vbOffset[slot] = off;
+        auto bind = [&](uint32_t slot, const Upload& u) {
+            VkDeviceSize off = u.offset;
+            if (slot < 16 && g_ds.valid && g_ds.vb[slot] == u.buf && g_ds.vbOffset[slot] == off) return;
+            vkCmdBindVertexBuffers(cmd, slot, 1, &u.buf, &off);
+            if (slot < 16) {
+                g_ds.vb[slot] = u.buf;
+                g_ds.vbOffset[slot] = off;
+            }
+        };
+        // attributes decoded on the CPU (PowerVR): the group's converted stream, at the binding the
+        // pipeline fetches it from; the raw copy only when some attribute still reads the guest's bytes
+        if (const uint32_t cpuCount = cpu_vertex_count(g, R.vertexCpuClasses)) {
+            const uint32_t slot = cpu_vertex_binding(*fs, g, R.vertexCpuClasses, R.props.limits.maxVertexInputBindings);
+            const uint32_t stride = (regs[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
+            if (slot < R.props.limits.maxVertexInputBindings) bind(slot, cpu_vertex_stream(g, addr, size, stride, cpuCount));
+            if (cpuCount == (uint32_t)g.attribCount) continue;
         }
+        bind((uint32_t)g.attributeBufferIndex, vertex_buffer(addr, size));
     }
     bind_stage(cmd, pipe->layout, regs, vs, true, vtex, targetScale, targetScaleY);
     bind_stage(cmd, pipe->layout, regs, ps, false, ptex, targetScale, targetScaleY);
@@ -2293,7 +3518,7 @@ static void record_draw(const uint32_t* regs, const Prepared& P, uint32_t prim, 
         }
     }
     if (g_hires_redraw) { g_hires_frame = R.frame; return; }  // the private copy is ready for the occlusion pass
-    if (ao_hires_enabled() && colors[0] && (regs[mmSQ_PGM_START_PS] << 8) == kDepthDownsamplePS) {
+    if (ao_hires_enabled() && ao_mode() != 3 && colors[0] && (regs[mmSQ_PGM_START_PS] << 8) == kDepthDownsamplePS) {
         g_hires_redraw = true;
         draw(regs, prim, count, indexType, indexAddr, baseVertex, instances);
         g_hires_redraw = false;
@@ -2305,11 +3530,14 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     static bool cacheLoaded = (cache_load(), true);
     (void)cacheLoaded;
     R.drawCount++;
+    prof_draw(regs[mmSQ_PGM_START_PS] << 8);
     draws_since_commit()++;
-    DLOG("[draw] prim %X count %u idx %u@%08X VS %08X PS %08X CB0 %08X info %08X DB %08X depthctl %08X blend %08X mask %08X",
+    DLOG("[draw] prim %X count %u idx %u@%08X VS %08X PS %08X CB0 %08X info %08X DB %08X depthctl %08X blend %08X mask %08X scmode %08X bias %08X/%08X %08X/%08X",
          prim, count, indexType, indexAddr, regs[mmSQ_PGM_START_VS] << 8, regs[mmSQ_PGM_START_PS] << 8, regs[mmCB_COLOR0_BASE],
          regs[mmCB_COLOR0_INFO], regs[mmDB_DEPTH_BASE], regs[REGADDR::DB_DEPTH_CONTROL], regs[REGADDR::CB_COLOR_CONTROL],
-         regs[REGADDR::CB_TARGET_MASK]);
+         regs[REGADDR::CB_TARGET_MASK], regs[REGADDR::PA_SU_SC_MODE_CNTL],
+         regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE], regs[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET],
+         regs[REGADDR::PA_SU_POLY_OFFSET_BACK_SCALE], regs[REGADDR::PA_SU_POLY_OFFSET_BACK_OFFSET]);
     if (!count || !instances) return;
     ((uint32_t*)regs)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
     if (regs[REGADDR::VGT_GS_MODE] & 3) { g_skip[SK_GS]++; return; }  // geometry shaders: not supported yet
@@ -2341,10 +3569,38 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         return;
     }
     Shader* vs = get_shader(regs, true, fs, fsKey);
-    Shader* ps = get_shader(regs, false, fs, fsKey);
+    Shader* ps = get_shader(regs, false, fs, fsKey, vs && shader_state(vs) != CS_FAILED ? vs : nullptr);
     if (!vs || !ps || shader_state(vs) == CS_FAILED || shader_state(ps) == CS_FAILED) { g_skip[SK_NO_SHADER]++; return; }
     compile_deferred(vs);
     compile_deferred(ps);
+    // debug: WWHD_DUMP_PS=addr,addr,... writes the translated pixel shader (and its vertex shader) of
+    // the first draw with that pixel shader address into WWHD_DUMP_SHADERS's folder (or ./shaders)
+    static std::set<uint32_t> dumpPS = [] {
+        std::set<uint32_t> d;
+        if (const char* e = getenv("WWHD_DUMP_PS"))
+            for (char* p = (char*)e; *p;) {
+                d.insert((uint32_t)strtoul(p, &p, 16));
+                while (*p == ',') p++;
+            }
+        return d;
+    }();
+    if (!dumpPS.empty()) {
+        uint32_t psAddr = regs[mmSQ_PGM_START_PS] << 8;
+        if (dumpPS.erase(psAddr)) {
+            const char* d = getenv("WWHD_DUMP_SHADERS");
+            std::string dir = d && d[0] == '/' ? d : "shaders";
+            mkdir(dir.c_str(), 0755);
+            for (Shader* sh : {ps, vs}) {
+                char name[64];
+                snprintf(name, sizeof name, "/live_%s_%08X.glsl", sh == ps ? "ps" : "vs", psAddr);
+                if (!sh->dec || !sh->dec->strBuf_shaderSource) continue;  // freed once compiled (free_source)
+                if (FILE* f = fopen((dir + name).c_str(), "w")) {
+                    fputs(sh->dec->strBuf_shaderSource->c_str(), f);
+                    fclose(f);
+                }
+            }
+        }
+    }
 
     const LatteContextRegister& lcr = *(const LatteContextRegister*)regs;
     Surface* colors[8] = {};
@@ -2353,6 +3609,16 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     for (int i = 0; i < 8; i++)
         if (mask & (1 << i)) colors[i] = color_target(regs, i, &colorSlices[i]);
     Surface* depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(regs, &depthSlice) : nullptr;
+    if (colors[0] && skip_hidden_drc_draw(colors[0]->width, colors[0]->height)) { g_skip[SK_HIDDEN_DRC]++; return; }
+    // "Distant shadows" off (Graphics setting, for weaker GPUs): the far shadow cascade (slice 2 of
+    // the game's depth-array shadow map) is not drawn, so it stays clear and casts nothing. It holds
+    // every caster again (~550 draws in Forest Haven, ~1.4 ms on an Adreno 650); the near and middle
+    // cascades keep the shadows around Link. WWHD_SHADOW_SKIP=mask leaves out other slices (tests).
+    if (depth && depth->slices > 1 && !colors[0] && !colors[1]) {
+        static const int skipTest = getenv("WWHD_SHADOW_SKIP") ? atoi(getenv("WWHD_SHADOW_SKIP")) : 0;
+        const int skip = skipTest | (!distant_shadows() && depth->slices == 3 ? 4 : 0);  // the game's 3 cascades
+        if (skip && depthSlice < 31 && ((skip >> depthSlice) & 1)) { g_skip[SK_FAR_SHADOW]++; return; }
+    }
     if (g_hires_redraw) {
         if (!colors[0]) return;
         g_hires_src = colors[0]->addr;
@@ -2366,17 +3632,54 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     for (auto& c : colors)
         if (c && !renderable(c)) c = nullptr;
     if (depth && !renderable(depth)) depth = nullptr;
+
+    // Diagnostic and user option: remove ambient occlusion completely. The later lighting pass
+    // multiplies by this texture, so white is the neutral result. Clear the actual AO target rather
+    // than merely skipping its draw, which would leave the previous frame's occlusion behind.
+    if (ao_mode() == 3 && (regs[mmSQ_PGM_START_PS] << 8) == kOcclusionPS) {
+        VkClearColorValue neutral{{1.0f, 1.0f, 1.0f, 1.0f}};
+        for (Surface* s : colors) {
+            if (!s) continue;
+            prepare(s->img, Use::COPY_DST);
+            VkImageSubresourceRange range{s->img.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+            vkCmdClearColorImage(command_buffer(), s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &neutral, 1, &range);
+            // The clear replaces this render target's contents just like a draw. Keep it the
+            // newest surface when multiple Vulkan images alias the same guest address; otherwise
+            // a later texture lookup can select an older AO image and make "off" ineffective.
+            mark_gpu_written(s);
+        }
+        g_prep_key.valid = false;
+        return;
+    }
+
     // one framebuffer size (image size, which includes the resolution scale) for all attachments;
     // drop mismatching ones (as the Metal renderer does)
     uint32_t w = 0, h = 0;
     float targetScale = 1.0f, targetScaleY = 1.0f;
     for (auto* c : colors)
-        if (c) { w = c->img.width; h = c->img.height; targetScale = c->rscale * c->ax; targetScaleY = c->rscale * c->ay; break; }
+        if (c) { w = c->img.width; h = c->img.height; targetScale = image_scale_x(c); targetScaleY = image_scale_y(c); break; }
     if (depth && w && (depth->img.width < w || depth->img.height < h)) { depth = nullptr; g_skip[SK_DROPPED_DEPTH]++; }
-    if (!w && depth) { w = depth->img.width; h = depth->img.height; targetScale = depth->rscale * depth->ax; targetScaleY = depth->rscale * depth->ay; }
+    if (!w && depth) { w = depth->img.width; h = depth->img.height; targetScale = image_scale_x(depth); targetScaleY = image_scale_y(depth); }
     for (auto& c : colors)
         if (c && (c->img.width != w || c->img.height != h)) { c = nullptr; g_skip[SK_DROPPED_COLOR]++; }
     if (!w) { g_skip[SK_NO_TARGET]++; return; }
+    // a HUD draw into the TV picture: its coverage too (hud_coverage_begin)
+    bool hudCov = false;
+    uint32_t covSlot = 0;
+    if (g_cov_frame == R.frame && g_cov_valid && colors[0] == g_cov_target && !g_hires_redraw) {
+        bool alone = true;
+        for (int i = 1; i < 8; i++) alone = alone && !colors[i];
+        CovModule cm = alone && ps->mod ? coverage_module(ps->mod) : CovModule{VK_NULL_HANDLE, 0};
+        if (cm.module && g_cov.img.width == w && g_cov.img.height == h && colors[0]->fmt.kind == FormatInfo::FLOAT) {
+            colors[cm.location] = &g_cov;
+            colorSlices[cm.location] = 0;
+            covSlot = cm.location;
+            hudCov = true;
+            g_cov_draws++;
+        } else {
+            g_cov_valid = false;  // this frame's in-between one: the old way
+        }
+    }
 
     // skipping while compiling only for targets drawn in each of the last 3 frames (see wait_compiled)
     bool everyFrame = true;
@@ -2419,14 +3722,50 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     // guest units -> image pixels: the resolution scale, times 1.5 for the private AO depth copy
     const float k = (g_hires_redraw ? 1.5f : 1.0f) * targetScale, ky = (g_hires_redraw ? 1.5f : 1.0f) * targetScaleY;
     uint32_t tl = regs[REGADDR::PA_SC_GENERIC_SCISSOR_TL], br = regs[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
-    uint32_t sx = std::min<uint32_t>((uint32_t)((tl & 0x7FFF) * k), w), sy = std::min<uint32_t>((uint32_t)(((tl >> 16) & 0x7FFF) * ky), h);
-    uint32_t ex = std::min<uint32_t>((uint32_t)((br & 0x7FFF) * k), w), ey = std::min<uint32_t>((uint32_t)(((br >> 16) & 0x7FFF) * ky), h);
+    // rounded, not truncated: a scissor ending at the guest target's edge ends at the image's edge
+    // (truncated, 1280 x 1.24875 left the last column of every widened target undrawn)
+    uint32_t sx = std::min<uint32_t>((uint32_t)lroundf((tl & 0x7FFF) * k), w), sy = std::min<uint32_t>((uint32_t)lroundf(((tl >> 16) & 0x7FFF) * ky), h);
+    uint32_t ex = std::min<uint32_t>((uint32_t)lroundf((br & 0x7FFF) * k), w), ey = std::min<uint32_t>((uint32_t)lroundf(((br >> 16) & 0x7FFF) * ky), h);
     if (ex <= sx || ey <= sy) { g_skip[SK_SCISSOR]++; return; }
 
     // textures: uploads, layout changes and copies happen before the render pass begins
     StageTextures vtex, ptex;
     resolve_textures(regs, vs, true, colors, depth, vtex);
     resolve_textures(regs, ps, false, colors, depth, ptex);
+    note_pass_reads(vtex);
+    note_pass_reads(ptex);
+    prepare_sampled(vtex);
+    prepare_sampled(ptex);
+
+    // A draw that binds a subset of the open render pass's attachments (the game switches between
+    // colour only, colour + its R8 second target, with and without depth on its main buffer) stays in
+    // that pass (ZeldaWWHDRecomp's Android work): its pipeline variant writes nothing to the attachments
+    // it doesn't bind and tests no depth when it binds none. Each avoided split saves a full store and
+    // reload of the main buffer on tiled GPUs. The textures are resolved already: one that is an
+    // attachment of the pass changed its layout and so ended the pass. WWHD_PASS_SUBSET=0: off.
+    uint32_t absentColors = 0;
+    bool depthAbsent = false;
+    {
+        static const bool subsetOn = [] { const char* e = getenv("WWHD_PASS_SUBSET"); return !e || atoi(e) != 0; }();
+        if (subsetOn && R.pass && !g_hires_redraw && R.passWidth == w && R.passHeight == h && colors[0] &&
+            R.passColor[0] == colors[0] && R.passColorSlice[0] == colorSlices[0]) {
+            bool ok = true;
+            for (int i = 0; i < 8 && ok; i++) {
+                if (colors[i]) ok = R.passColor[i] == colors[i] && R.passColorSlice[i] == colorSlices[i];
+                else if (R.passColor[i]) absentColors |= 1u << i;
+            }
+            if (depth) ok = ok && R.passDepth == depth && R.passDepthSlice == depthSlice;
+            else depthAbsent = R.passDepth != nullptr;
+            if (ok && (absentColors || depthAbsent)) {
+                for (int i = 0; i < 8; i++)
+                    if ((absentColors >> i) & 1) { colors[i] = R.passColor[i]; colorSlices[i] = R.passColorSlice[i]; }
+                if (depthAbsent) { depth = R.passDepth; depthSlice = R.passDepthSlice; }
+            } else {
+                absentColors = 0;
+                depthAbsent = false;
+            }
+        }
+    }
 
     PipelineState st;
     for (int i = 0; i < 8; i++)
@@ -2439,18 +3778,29 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
         st.pass.stencil = depth->fmt.stencil;
     }
     for (int i = 0; i < 8; i++) st.blend[i] = regs[REGADDR::CB_BLEND0_CONTROL + i];
+    set_hud_cov_slot(st, hudCov ? covSlot : 0);
     st.colorControl = regs[REGADDR::CB_COLOR_CONTROL];
     st.targetMask = regs[REGADDR::CB_TARGET_MASK];
+    for (int i = 0; i < 8; i++)
+        if ((absentColors >> i) & 1) st.targetMask &= ~(0xFu << (4 * i));
     st.topology = (uint32_t)ptype;
     st.cull = (cf ? 1 : 0) | (cb ? 2 : 0);
     st.frontCCW = pm.get_FRONT_FACE() == LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW;
-    st.depthControl = depth ? regs[REGADDR::DB_DEPTH_CONTROL] : 0;
+    st.depthControl = depth && !depthAbsent ? regs[REGADDR::DB_DEPTH_CONTROL] : 0;
     LATTE_PA_CL_CLIP_CNTL clipCntl;
     uint32_t clipRaw = regs[REGADDR::PA_CL_CLIP_CNTL];
     memcpy(&clipCntl, &clipRaw, 4);
     st.depthClamp = clipCntl.get_ZCLIP_FAR_DISABLE() ? 1 : 0;
 
     Pipeline* pipe = get_pipeline(regs, vs, ps, fs, fsKey, st);
+    if (!pipe && hudCov) {  // its coverage variant is still compiling: drawn as usual, the frame generated the old way
+        hudCov = false;
+        g_cov_valid = false;
+        colors[covSlot] = nullptr;
+        set_hud_cov_slot(st, 0);
+        st.pass.color[covSlot] = 0;
+        pipe = get_pipeline(regs, vs, ps, fs, fsKey, st);
+    }
     g_wait_whole = false;
     if (!pipe) { g_skip[SK_PIPE_COMPILING]++; return; }
 
@@ -2466,8 +3816,8 @@ void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexTyp
     P.w = w;
     P.h = h;
     P.targetScale = targetScale;
-    P.targetScaleY = targetScaleY;
     P.k = k;
+    P.targetScaleY = targetScaleY;
     P.ky = ky;
     P.sx = sx; P.sy = sy; P.ex = ex; P.ey = ey;
     P.vtex = vtex;

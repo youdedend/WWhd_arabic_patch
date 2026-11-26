@@ -1,7 +1,8 @@
 // Optional gameplay mods (Gameplay menu). All off by default; each can be switched live.
 //   camera.cpp  direct right-stick camera, mouse camera, first person on R3 / mouse wheel
 //   mouse.mm    mouse capture in the game window (macOS events)
-//   turbo.cpp   quick doors and fast scene changes (extra logic steps while they run)
+//   turbo.cpp   quick doors, fast scene changes and fast forward (extra logic steps while they run)
+//   cheats.cpp  items, sword/shield, stats, infinite health/magic/ammo, songs, Triforce, dungeon items
 //   mods.cpp    faster running (true60_link.cpp's posMoveFromFootPos site applies it)
 // Test/start-up switches: WWHD_MOD_<NAME>=1 (see mods.cpp).
 #pragma once
@@ -17,6 +18,8 @@ bool direct_camera();
 void set_direct_camera(bool on);
 float camera_speed();  // direct camera: multiplier of the game's own top turning speed
 void set_camera_speed(float s);
+float camera_zoom();   // pinch zoom (touch): the drawn camera's distance to its target x this (1 = the game's)
+void set_camera_zoom(float z);
 bool mouse_camera();
 void set_mouse_camera(bool on);
 float mouse_sensitivity();  // degrees per mouse point
@@ -37,7 +40,16 @@ int run_mode();
 void set_run_mode(int m);
 int swim_mode();
 void set_swim_mode(int m);
-void run_input(uint32_t buttons);  // filter_pad: the GamePad buttons of this read (L3 edges)
+void run_input(uint32_t buttons);  // filter_pad: the GamePad buttons of this read (L3 edges, ZR)
+void stick_input(float x, float y);  // filter_pad: the left stick of this read
+// fast forward (turbo.cpp): while ZR is held, cutscenes / dialogues run several logic steps per
+// frame
+bool ff_cutscenes();
+void set_ff_cutscenes(bool on);
+bool ff_dialogues();
+void set_ff_dialogues(bool on);
+bool ff_button();  // ZR is held (last pad read)
+int event_mode_now();  // turbo.cpp: 0 no event, 1 dialogue, 2 / 3 cutscene
 // for daPy_lk_c::posMoveFromFootPos (true60_link.cpp): the factor for Link's horizontal movement
 // this step (run_speed() while he runs, else 1); link = the daPy_lk_c
 float link_move_factor(uint32_t link);
@@ -59,6 +71,31 @@ void mouse_release();  // mouse.mm: release the pointer (also called when the mo
 // ---- logic (interp.cpp: fpcEx_Handler) ----
 // after a normal logic step: runs extra steps while a door event or a scene change is in progress
 void after_execute(Cpu* c, uint32_t execute_fn);
+
+// ---- cheats (cheats.cpp): one-shot save data edits, applied at the top of the next frame ----
+enum Cheat {
+    kCheatItems = 1, kCheatSword = 2, kCheatStats = 4,
+    // story progress (can change or break story events)
+    kCheatSongs = 8, kCheatTriforce = 16, kCheatDungeon = 32, kCheatKey = 64,
+};
+void request_cheat(int which);  // any thread
+// the loaded save's address and whether a file is actually being played (not the title / file select):
+// used by the cheats and by the autosave (savestate.cpp) to know when snapshots make sense
+uint32_t save_addr();
+bool save_loaded(uint32_t s);
+enum Infinite { kInfHealth = 1, kInfMagic = 2, kInfAmmo = 4, kMoonJump = 8, kMoonNoFall = 16, kMoonAllAnims = 32 };  // switches (kMoonJump: hold L)
+bool infinite(int which);
+void set_infinite(int which, bool on);
+void cheats_service();          // game main thread, frame start (interp.cpp)
+void moon_jump_step(Cpu* c, uint32_t link, bool before);  // around daPy_lk_c::execute (climb.cpp)
+// the moon jump's horizontal move for Link's `current.pos += speed` in this step (true60_link.cpp)
+bool moon_jump_move(uint32_t link, float& x, float& z);
+// rise and flight speed in percent of the tested values (25 and 40 units per step), from the menu
+void set_moon_jump_speeds(int rise, int fly);
+int moon_jump_rise();
+int moon_jump_fly();
+bool l_held();                  // the GamePad's L (shoulder) in the latest read (run_input)
+void left_stick(float& x, float& y);  // ... and its left stick (-1..1, +y up)
 
 // shared helpers (mods.cpp)
 uint64_t step();    // full logic steps so far (interp::logic_steps)

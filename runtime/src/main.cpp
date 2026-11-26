@@ -57,6 +57,11 @@ static void crash_write(const char* buf, int n) {
 // project's crash_addr.cpp; dladdr is not async-signal-safe, the same exposure as the backtrace)
 static int describe_host(char* buf, size_t cap, uintptr_t addr) {
     Dl_info di{};
+    uint32_t gf, off;
+    if (crash_info::guest_function(addr, &gf, &off)) {
+        int n = snprintf(buf, cap, " in game function %08X+%#x", gf, off);
+        return n < 0 ? 0 : (size_t)n >= cap ? (int)cap - 1 : n;
+    }
     if (!dladdr((const void*)addr, &di) || !di.dli_fname) return 0;
     const char* name = strrchr(di.dli_fname, '/');
     name = name ? name + 1 : di.dli_fname;
@@ -66,27 +71,32 @@ static int describe_host(char* buf, size_t cap, uintptr_t addr) {
     return n < 0 ? 0 : (size_t)n >= cap ? (int)cap - 1 : n;
 }
 
-static void crash_handler(int sig, siginfo_t* si, void* uctx) {
-    uintptr_t a = (uintptr_t)si->si_addr;
-    uintptr_t base = (uintptr_t)PPC_MEM_BASE;
-    // a crash log to send with a report: captures/tlozwwhd_VERSION_YYYYmmdd-HHMMSS.log (the app's files
-    // folder; the app offers it for sharing, CrashLogs.java)
-    char path[96];
-    {
-        mkdir("captures", 0755);
-        time_t t = time(nullptr);
-        struct tm tmv;
-        localtime_r(&t, &tmv);
-        strftime(path, sizeof path, g_crash_name, &tmv);
-        g_crash_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    }
+// a crash log to send with a report: captures/tlozwwhd_VERSION_YYYYmmdd-HHMMSS.log (the app's files
+// folder; the app offers it for sharing, CrashLogs.java). Also used for game halts (coreinit_misc.cpp).
+static char g_crash_path[96];
+void crash_log_open() {
+    mkdir("captures", 0755);
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(g_crash_path, sizeof g_crash_path, g_crash_name, &tmv);
+    g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+}
+void crash_log_write(const char* s, int n) { crash_write(s, n); }
+int crash_log_fd() { return g_crash_fd; }
+void crash_log_close() {
+    if (g_crash_fd < 0) return;
+    close(g_crash_fd);
+    g_crash_fd = -1;
+    char buf[160];
+    int n = snprintf(buf, sizeof buf, "[crash] wrote %s\n", g_crash_path);
+    crash_write(buf, n);
+}
+
+// what every crash log says after its first line: GPU, thread, time, place, app and settings
+void crash_log_details() {
     char buf[512];
     int n;
-    if (a >= base && a < base + 0x100000000ull)
-        n = snprintf(buf, sizeof buf, "\nCRASH: signal %d at guest address %08X\n", sig, (unsigned)(a - base));
-    else
-        n = snprintf(buf, sizeof buf, "\nCRASH: signal %d at host address %p\n", sig, si->si_addr);
-    crash_write(buf, n);
 #ifdef __ANDROID__
     // the GPU and its driver: many crashes are in a driver
     n = snprintf(buf, sizeof buf, "  GPU %s, driver %s\n", gfx::gpu_name(), gfx::driver_info());
@@ -112,6 +122,33 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
         const char* info = crash_info::text();
         crash_write(info, (int)strlen(info));
     }
+}
+
+extern "C" void wwhd_compile_journal_on_crash() __attribute__((weak));  // vk/vk_draw.cpp
+
+static void crash_handler(int sig, siginfo_t* si, void* uctx) {
+    // a crash while compiling a shader or pipeline: noted so the next start leaves it out
+    if (wwhd_compile_journal_on_crash) wwhd_compile_journal_on_crash();
+    uintptr_t a = (uintptr_t)si->si_addr;
+    uintptr_t base = (uintptr_t)PPC_MEM_BASE;
+    crash_log_open();
+    char buf[512];
+    int n;
+    if (sig == SIGABRT)  // si_addr means nothing here
+        n = snprintf(buf, sizeof buf, "\nCRASH: signal %d (abort)\n", sig);
+    else if (a >= base && a < base + 0x100000000ull)
+        n = snprintf(buf, sizeof buf, "\nCRASH: signal %d at guest address %08X\n", sig, (unsigned)(a - base));
+    else
+        n = snprintf(buf, sizeof buf, "\nCRASH: signal %d at host address %p\n", sig, si->si_addr);
+    crash_write(buf, n);
+    crash_log_details();
+    {
+        char pn[200];
+        int k = platform::process_numbers(pn, sizeof pn);
+        crash_write("  process: ", 11);
+        crash_write(pn, k);
+        crash_write("\n", 1);
+    }
     // the faulting instruction and the module holding it (a GPU driver, a Vulkan layer, the game code)
     uintptr_t pc = 0;
 #if defined(__aarch64__)
@@ -124,8 +161,14 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
         where[describe_host(where, sizeof where, pc)] = 0;
         n = snprintf(buf, sizeof buf, "  host pc %p%s\n", (void*)pc, where);
         crash_write(buf, std::min<int>(n, sizeof buf - 1));
+        // a crash inside the GPU driver: the next start runs in the GPU safe mode
+        if (strstr(where, "vulkan") || strstr(where, "adreno") || strstr(where, "gsl") || strstr(where, "freedreno")
+            || strstr(where, "mali") || strstr(where, "GLES") || strstr(where, "pvr") || strstr(where, "llvm-glnext")) {
+            void gpu_crash_marker(const char* why);
+            gpu_crash_marker(where);
+        }
     }
-    if (!(a >= base && a < base + 0x100000000ull) && describe_host(where, sizeof where, a)) {
+    if (sig != SIGABRT && !(a >= base && a < base + 0x100000000ull) && describe_host(where, sizeof where, a)) {
         n = snprintf(buf, sizeof buf, "  fault address %p%s\n", si->si_addr, where);
         crash_write(buf, std::min<int>(n, sizeof buf - 1));
     }
@@ -137,6 +180,28 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
             n = snprintf(buf, sizeof buf, "  r%-2d %08X %08X %08X %08X %08X %08X %08X %08X\n", i, c->r[i], c->r[i + 1],
                          c->r[i + 2], c->r[i + 3], c->r[i + 4], c->r[i + 5], c->r[i + 6], c->r[i + 7]);
             crash_write(buf, n);
+        }
+        // guest memory at registers that point into game data (heaps, objects, the stack): 128 bytes
+        // each, so a crash in game code shows the state it read (e.g. a heap that ran out). The whole
+        // guest address space is mapped readable (core.cpp), so these reads can't fault.
+        uint32_t dumped[12];
+        int nd = 0;
+        for (int i = 0; i < 32 && nd < 12; i++) {
+            if (i == 2 || i == 13) continue;  // the game's constant and small-data areas: always the same
+            uint32_t v = c->r[i] & ~3u;
+            if (v < 0x10000000u || v >= 0x80000000u) continue;
+            bool seen = false;
+            for (int k = 0; k < nd; k++) seen |= dumped[k] == v;
+            if (seen) continue;
+            dumped[nd++] = v;
+            n = snprintf(buf, sizeof buf, "  memory at r%d (%08X):\n", i, v);
+            crash_write(buf, n);
+            for (uint32_t o = 0; o < 128; o += 32) {
+                n = snprintf(buf, sizeof buf, "    +%02X %08X %08X %08X %08X %08X %08X %08X %08X\n", o, ld32(v + o),
+                             ld32(v + o + 4), ld32(v + o + 8), ld32(v + o + 12), ld32(v + o + 16), ld32(v + o + 20),
+                             ld32(v + o + 24), ld32(v + o + 28));
+                crash_write(buf, n);
+            }
         }
         // guest return chain (back-chain words on the guest stack)
         crash_write("  guest call chain:", 19);
@@ -152,12 +217,7 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
     }
     crash_write("  host backtrace:\n", 18);
     platform::print_backtrace(g_crash_fd);
-    if (g_crash_fd >= 0) {
-        close(g_crash_fd);
-        g_crash_fd = -1;
-        n = snprintf(buf, sizeof buf, "[crash] wrote %s\n", path);
-        crash_write(buf, n);
-    }
+    crash_log_close();
     if (g_ppc_trace) {
         FILE* f = fopen("trace_dump.txt", "w");
         if (f) { trace_dump(f, 3000); fclose(f); crash_write("[trace] wrote trace_dump.txt\n", 29); }
@@ -188,7 +248,9 @@ static void install_crash_handler() {
     struct sigaction sa{};
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(sig, &sa, &g_prev_action[sig]);
+    // SIGABRT too: aborts in a GPU driver (issue #30) or fatal() get a log of their own (then the previous
+    // handler, debuggerd, as for the others)
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &sa, &g_prev_action[sig]);
 }
 
 static void init_data_imports() {
@@ -240,6 +302,7 @@ void boot_runtime() {
     uint32_t arg0 = mem::runtime_alloc(16);
     mem::write_cstr(arg0, "cking.rpx", 16);
     st32(g_argv, arg0);
+    crash_info::index_functions();  // game functions in crash logs
     g_game_loaded = true;
 }
 

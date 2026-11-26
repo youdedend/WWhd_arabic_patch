@@ -2,7 +2,9 @@
 #ifdef __APPLE__
 #include <mach-o/ldsyms.h>  // _mh_execute_header
 #endif
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -23,6 +25,7 @@
 bool g_trace_hle = getenv("WWHD_TRACE_HLE") != nullptr;  // log HLE calls and file accesses (macOS: --trace)
 namespace config {
 std::string game_dir = "game";
+std::string content_overlay;
 std::string save_dir = "save";
 std::string cache_dir;
 std::string code_dir;
@@ -51,11 +54,28 @@ void log_msg(const char* fmt, ...) {
     va_end(ap);
 }
 
+// the app's GPU crash marker (WWHD_GPU_CRASH_FILE): why the last session ended, read at the next
+// start to turn on the GPU safe mode (MainActivity). Written for Vulkan errors (device lost, a
+// driver failing) and crashes inside the GPU driver (main.cpp's crash handler).
+void gpu_crash_marker(const char* why) {
+    static const char* path = getenv("WWHD_GPU_CRASH_FILE");
+    if (!path || !*path) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, why, strlen(why));
+    close(fd);
+}
+
 void fatal(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     log_v("FATAL: ", fmt, ap);
     va_end(ap);
+    char msg[512];
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    if (strstr(msg, "VkResult") || strstr(msg, "vk") || strstr(msg, "Vulkan")) gpu_crash_marker(msg);
     abort();
 }
 
@@ -67,6 +87,18 @@ void init() {
     if (!platform::map_fixed(PPC_MEM_BASE, 0x100000000ull)) fatal("cannot reserve guest address space at %p", PPC_MEM_BASE);
     // null page guard: catches guest null-pointer accesses
     mprotect(PPC_MEM_BASE, 0x10000, PROT_NONE);
+    // guard ranges around the window: the recompiled code's D-form accesses add their offset (+-32 KiB)
+    // in 64 bits (recomp/ops.c), so one that wraps on the console lands here and faults
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    for (uint8_t* g : {PPC_MEM_BASE - 0x10000, PPC_MEM_BASE + 0x100000000ull}) {
+        void* p = mmap(g, 0x10000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != (void*)g) {
+            if (p != MAP_FAILED) munmap(p, 0x10000);
+            LOG("[mem] no guard range at %p (taken): an access wrapping past the guest window isn't caught", g);
+        }
+    }
 }
 
 // start of the loaded executable (macOS) or shared library (Android)
@@ -176,6 +208,8 @@ bool load_rpx(const std::string& path, LoadedModule& out) {
 }
 
 // ---------------------------------------------------------------- dispatch
+extern "C" PpcFunc* g_ppc_text_table = nullptr;
+
 namespace dispatch {
 static constexpr uint32_t kTextBase = 0x02000000;
 static constexpr uint32_t kTextSize = 0x01000000;  // 16 MiB covers cking.rpx .text
@@ -192,6 +226,7 @@ static std::unordered_map<uint32_t, std::string> g_host_names;
 
 void init() {
     g_text_table = (PpcFunc*)calloc(kTextSize / 4, sizeof(PpcFunc));
+    g_ppc_text_table = g_text_table;  // for the recompiled code's inline lookup (ppc.h)
     for (unsigned i = 0; i < g_recomp_func_count; i++) set(g_recomp_funcs[i].addr, g_recomp_funcs[i].fn);
     // imported functions are reachable through their import slot addresses
     for (unsigned i = 0; i < g_recomp_import_count; i++)
@@ -226,12 +261,53 @@ std::vector<std::pair<uint32_t, std::string>> host_functions() {
     return v;
 }
 
+// A host function's address comes from its name (a free slot from the name's hash), not from the
+// order of registration: some are registered on demand (true60_noop_proc with some frame rates), so
+// a save state (which holds these addresses in guest memory) failed to load in another session or
+// app version. The first 4096 slots stay free for the addresses of states saved before this, given
+// back by alias_host.
+static constexpr uint32_t kHostLegacySlots = 4096;
+static std::unordered_map<uint32_t, std::string> g_host_pending;  // address -> name, aliased once registered
+
 uint32_t register_host(PpcFunc fn, const char* name) {
-    uint32_t a = g_next_host.fetch_add(8);
-    set(a, fn);
+    (void)g_next_host;
     std::unique_lock lk(g_other_mutex);
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = name; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    const uint32_t slots = kHostSize / 8 - kHostLegacySlots;
+    uint32_t i = (uint32_t)(h % slots);
+    while (g_host_names.count(mem::kHleFuncBase + (kHostLegacySlots + i) * 8)) i = (i + 1) % slots;
+    uint32_t a = mem::kHleFuncBase + (kHostLegacySlots + i) * 8;
+    g_host_table[(a - mem::kHleFuncBase) >> 3] = fn;
     g_host_names[a] = name;
+    // a loaded save state had it at another address
+    for (auto it = g_host_pending.begin(); it != g_host_pending.end();) {
+        if (it->second == name && !g_host_names.count(it->first)) {
+            g_host_table[(it->first - mem::kHleFuncBase) >> 3] = fn;
+            g_host_names[it->first] = name;
+            it = g_host_pending.erase(it);
+        } else {
+            ++it;
+        }
+    }
     return a;
+}
+
+// a save state's host function at `addr`: the function registered under `name` there too (now, or
+// when it is registered). False if another function has that address.
+bool alias_host(uint32_t addr, const std::string& name) {
+    std::unique_lock lk(g_other_mutex);
+    auto at = g_host_names.find(addr);
+    if (at != g_host_names.end()) return at->second == name;
+    if (addr - mem::kHleFuncBase >= kHostSize || (addr & 7)) return false;
+    for (auto& [a, n] : g_host_names)
+        if (n == name) {
+            g_host_table[(addr - mem::kHleFuncBase) >> 3] = g_host_table[(a - mem::kHleFuncBase) >> 3].load();
+            g_host_names[addr] = name;
+            return true;
+        }
+    g_host_pending[addr] = name;
+    return true;
 }
 }  // namespace dispatch
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # macOS: the `wwhd` executable (Metal). Android: `libwwhd.so` (Vulkan), loaded by the app in android/.
-if(APPLE)
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")  # APPLE is the host before project(): an Android build on a Mac too
   project(wwhd_recomp C CXX OBJCXX)
 else()
   project(wwhd_recomp C CXX ASM)
@@ -9,6 +9,11 @@ endif()
 # no paths of the build machine in the binaries (__FILE__ in checks, debug info, the ops.c bitcode):
 # file names are relative to the repository
 add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=" "-ffile-prefix-map=${CMAKE_BINARY_DIR}/=build/")
+# Linux and Android on arm64: plain char is unsigned in that ABI, but signed on x86-64 and Apple
+# arm64, where the runtime and the recompiled game code are tested (original project, 2a54901).
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  add_compile_options(-fsigned-char)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
@@ -16,16 +21,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
-
-# build tag in portable save states and logs ("android-0.6 (a1b2c3d)"): the app version (Gradle
-# passes -DWWHD_APP_VERSION=<versionName>) and the git commit
-execute_process(COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD OUTPUT_VARIABLE WWHD_GIT_HASH
-                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT WWHD_GIT_HASH)
-  set(WWHD_GIT_HASH "unknown")
-endif()
-set(WWHD_APP_VERSION "0.6" CACHE STRING "app version in build tags")
-add_compile_definitions("WWHD_RUNTIME_VERSION=\"android-${WWHD_APP_VERSION} (${WWHD_GIT_HASH})\"")
 
 # The game code: either recompiled on the PC (tools/recomp/recomp.py -> build/gen, linked in), or,
 # for an APK without game code, recompiled on the device and loaded at startup (runtime/src/recomp)
@@ -63,6 +58,9 @@ endif()
 add_library(cemu_latte STATIC ${CEMU_SOURCES})
 target_include_directories(cemu_latte PUBLIC ${CEMU_DIR} ${CEMU_DIR}/Cafe ${CMAKE_SOURCE_DIR}/runtime/third_party/fmt/include)
 target_compile_options(cemu_latte PRIVATE "SHELL:-include ${CEMU_DIR}/cemu_shim.h")
+# the decompiler reads which vertex attributes the CPU decodes (runtime/src/vk/vertex_cpu_policy.h);
+# after the vendored directories so their headers keep precedence
+target_include_directories(cemu_latte AFTER PRIVATE ${CMAKE_SOURCE_DIR}/runtime/src)
 if(APPLE)
   target_include_directories(cemu_latte PUBLIC ${CMAKE_SOURCE_DIR}/runtime/third_party/metal-cpp)
   target_compile_definitions(cemu_latte PUBLIC ENABLE_METAL=1)
@@ -71,9 +69,10 @@ else()
 endif()
 target_compile_options(cemu_latte PRIVATE -w -O2)
 
-# ---- vendored zstd (BSD): its decoder only, for Cemu .wua archives (runtime/src/disc/wua.cpp)
+# ---- vendored zstd 1.5.7 (BSD): Cemu .wua archives (runtime/src/disc/wua.cpp) and save states
+# (savestate.cpp); without its multithreaded compressor
 set(ZSTD_DIR ${CMAKE_SOURCE_DIR}/runtime/third_party/zstd/lib)
-file(GLOB ZSTD_SOURCES CONFIGURE_DEPENDS ${ZSTD_DIR}/common/*.c ${ZSTD_DIR}/decompress/*.c)
+file(GLOB ZSTD_SOURCES CONFIGURE_DEPENDS ${ZSTD_DIR}/common/*.c ${ZSTD_DIR}/decompress/*.c ${ZSTD_DIR}/compress/*.c)
 add_library(zstd_dec STATIC ${ZSTD_SOURCES})
 target_include_directories(zstd_dec PUBLIC ${ZSTD_DIR})
 target_compile_definitions(zstd_dec PRIVATE ZSTD_DISABLE_ASM ZSTD_LEGACY_SUPPORT=0)
@@ -117,10 +116,9 @@ if(APPLE)
   # controls mapping unit tests (runtime/src/input_map.cpp)
   add_executable(input_map_test runtime/tools/input_map_test.cpp runtime/src/input_map.cpp)
   target_include_directories(input_map_test PRIVATE runtime/src)
-
-  # quick doors: extra logic steps against the game's process deletion (runtime/src/mods/turbo_steps.h)
-  add_executable(turbo_steps_test runtime/tools/turbo_steps_test.cpp)
-  target_compile_options(turbo_steps_test PRIVATE -UNDEBUG)
+  # frame interpolation: hidden joints that were not updated (Link's hand poses) are drawn at the current step (runtime/src/interp_joints.h)
+  add_executable(interp_joints_test runtime/tools/interp_joints_test.cpp)
+  target_compile_options(interp_joints_test PRIVATE -UNDEBUG)
 
   # right-to-left text: shaping, bidi order and line layout on their own (runtime/src/rtl_text.h)
   add_executable(rtl_text_test runtime/tools/rtl_text_test.cpp runtime/src/rtl_text.cpp)
@@ -186,7 +184,7 @@ elseif(ANDROID)
     "This project|MPL-2.0|${CMAKE_SOURCE_DIR}/LICENSE"
     "Cemu (GPU address library and shader decompiler, in runtime/third_party/cemu)|MPL-2.0 (same license text as this project)|"
     "{fmt}|MIT|${CMAKE_SOURCE_DIR}/runtime/third_party/fmt/LICENSE"
-    "Zstandard (zstd, reads .wua archives)|BSD-3-Clause|${CMAKE_SOURCE_DIR}/runtime/third_party/zstd/LICENSE"
+    "Zstandard (zstd: .wua archives, save states)|BSD-3-Clause|${CMAKE_SOURCE_DIR}/runtime/third_party/zstd/LICENSE"
     "glslang|BSD-3-Clause and others|${glslang_SOURCE_DIR}/LICENSE.txt"
     "Vulkan Memory Allocator|MIT|${vma_SOURCE_DIR}/LICENSE.txt"
     "volk|MIT|${volk_SOURCE_DIR}/LICENSE.md"
@@ -202,8 +200,8 @@ elseif(ANDROID)
     endif()
     llvm_map_components_to_libnames(WWHD_LLVM_LIBS ${WWHD_LLVM_COMPONENTS})
     target_sources(wwhd PRIVATE runtime/src/recomp/program.cpp runtime/src/recomp/decode.cpp runtime/src/recomp/emit.cpp
-                                runtime/src/recomp/compile.cpp ${CMAKE_BINARY_DIR}/recomp_data.S)
-    set_source_files_properties(runtime/src/recomp/emit.cpp runtime/src/recomp/compile.cpp PROPERTIES
+                                runtime/src/recomp/locals.cpp runtime/src/recomp/compile.cpp ${CMAKE_BINARY_DIR}/recomp_data.S)
+    set_source_files_properties(runtime/src/recomp/emit.cpp runtime/src/recomp/locals.cpp runtime/src/recomp/compile.cpp PROPERTIES
                                 INCLUDE_DIRECTORIES "${LLVM_INCLUDE_DIRS}")
     target_compile_definitions(wwhd PRIVATE WWHD_RECOMP=1 WWHD_RELEASE_MAPS=1)  # release.cpp: the EUR and JPN address maps
     target_link_libraries(wwhd PRIVATE ${WWHD_LLVM_LIBS})
@@ -212,7 +210,7 @@ elseif(ANDROID)
     set(OPS_BC ${CMAKE_BINARY_DIR}/ops.bc)
     add_custom_command(OUTPUT ${OPS_BC}
       # relative paths: the bitcode records the source file name as given (embedded in the APK)
-      COMMAND ${CMAKE_C_COMPILER} --target=aarch64-linux-android30 -O2 -ffp-contract=off -fno-strict-aliasing -emit-llvm
+      COMMAND ${CMAKE_C_COMPILER} --target=aarch64-linux-android30 -O2 -ffp-contract=off -fno-strict-aliasing -fwrapv -emit-llvm
               -c runtime/src/recomp/ops.c -Iruntime/include -o ${OPS_BC}
       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
       DEPENDS runtime/src/recomp/ops.c runtime/include/ppc.h VERBATIM)
@@ -221,7 +219,11 @@ elseif(ANDROID)
 "    .section .rodata
     .balign 16
     .global wwhd_ops_bc, wwhd_ops_bc_end, wwhd_hooks, wwhd_hooks_end, wwhd_release_eur, wwhd_release_eur_end
-    .global wwhd_release_jpn, wwhd_release_jpn_end
+    .global wwhd_release_jpn, wwhd_release_jpn_end, wwhd_hot, wwhd_hot_end, wwhd_covered, wwhd_covered_end
+wwhd_hot: .incbin \"${HOOKS_DIR}/hot_functions.txt\"
+wwhd_hot_end:
+wwhd_covered: .incbin \"${HOOKS_DIR}/covered_functions.txt\"
+wwhd_covered_end:
 wwhd_release_eur: .incbin \"${HOOKS_DIR}/release_eur.txt\"
 wwhd_release_eur_end:
 wwhd_release_jpn: .incbin \"${HOOKS_DIR}/release_jpn.txt\"
@@ -238,10 +240,14 @@ wwhd_hooks:
     .incbin \"${HOOKS_DIR}/hooks_aspect.txt\"
     .byte 10
     .incbin \"${HOOKS_DIR}/hooks_rtl.txt\"
+    .byte 10
+    .incbin \"${HOOKS_DIR}/hooks_perf.txt\"
+    .byte 10
+    .incbin \"${HOOKS_DIR}/hooks_resmgr.txt\"
 wwhd_hooks_end:
 ")
     set_source_files_properties(${CMAKE_BINARY_DIR}/recomp_data.S PROPERTIES OBJECT_DEPENDS
-      "${OPS_BC};${HOOKS_DIR}/hooks.txt;${HOOKS_DIR}/hooks_climb.txt;${HOOKS_DIR}/hooks_mods.txt;${HOOKS_DIR}/hooks_aspect.txt;${HOOKS_DIR}/hooks_rtl.txt;${HOOKS_DIR}/release_eur.txt;${HOOKS_DIR}/release_jpn.txt")
+      "${OPS_BC};${HOOKS_DIR}/hooks.txt;${HOOKS_DIR}/hooks_climb.txt;${HOOKS_DIR}/hooks_mods.txt;${HOOKS_DIR}/hooks_aspect.txt;${HOOKS_DIR}/hooks_rtl.txt;${HOOKS_DIR}/hooks_perf.txt;${HOOKS_DIR}/hooks_resmgr.txt;${HOOKS_DIR}/hot_functions.txt;${HOOKS_DIR}/covered_functions.txt;${HOOKS_DIR}/release_eur.txt;${HOOKS_DIR}/release_jpn.txt")
 
     if(WWHD_DEVICE_RECOMP)
       # The game code is linked at startup (loader.cpp). The game functions the runtime calls
@@ -274,7 +280,8 @@ wwhd_hooks_end:
       # Cpu layout in ppc.h) and LLVM; the hook lists are hashed at runtime (loader.cpp)
       set(RECOMP_VERSION_FILES runtime/src/recomp/compile.cpp runtime/src/recomp/compile.h runtime/src/recomp/decode.cpp
           runtime/src/recomp/decode.h runtime/src/recomp/emit.cpp runtime/src/recomp/emit.h runtime/src/recomp/program.cpp
-          runtime/src/recomp/program.h runtime/src/recomp/ops.c runtime/include/ppc.h)
+          runtime/src/recomp/program.h runtime/src/recomp/locals.cpp runtime/src/recomp/locals.h runtime/src/recomp/ops.c
+          runtime/include/ppc.h)
       list(TRANSFORM RECOMP_VERSION_FILES PREPEND ${CMAKE_SOURCE_DIR}/)
       string(REPLACE ";" "|" files_arg "${RECOMP_VERSION_FILES}")
       add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/recomp_version.h

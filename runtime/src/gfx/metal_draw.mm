@@ -9,7 +9,6 @@ extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relev
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
-#include "gfx/area_sample.h"
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
 #include "gx2/gx2.h"
 #include "gx2/gx2_cmd.h"
@@ -389,7 +388,6 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     double t0 = now_ms();
     LatteShader_UpdatePSInputs((uint32*)regs);
     LatteDecompilerOptions opt;
-    if (!vertex) opt.areaSampledTextures = ::gfx::area_sample::units_for_pixel_shader(mem::ptr(addr), size);
     LatteDecompilerOutput_t out{};
     if (vertex)
         LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);
@@ -401,15 +399,6 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
         return s;
     }
     s->dec = FinishDecompiledShader(out);
-    if (opt.areaSampledTextures) {
-        std::string src = s->dec->strBuf_shaderSource->c_str();
-        if (::gfx::area_sample::rewrite(src, opt.areaSampledTextures, true) > 0) {
-            s->dec->strBuf_shaderSource->reset();
-            s->dec->strBuf_shaderSource->add(std::string_view(src));
-        } else {
-            LOG("[gfx] pixel shader %08X: area-sampled taps not applied", addr);
-        }
-    }
     cache_record_shader(regs, vertex);
     double t1 = now_ms();
     g_t_decompile += t1 - t0;

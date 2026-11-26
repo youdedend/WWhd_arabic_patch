@@ -18,9 +18,15 @@
 
 namespace gfx {
 
+// the GPU driver lost the device (it hung or crashed): leaves a note for the app's next start, which
+// offers to load another GPU driver (vk_device.cpp)
+void vk_note_device_lost();
+// vkCreateGraphicsPipelines with the pipeline cache, one at a time where the driver needs it (vk_device.cpp)
+VkResult create_graphics_pipeline(const VkGraphicsPipelineCreateInfo* ci, VkPipeline* out);
 #define VK_CHECK(x)                                                                     \
     do {                                                                                \
         VkResult r_ = (x);                                                              \
+        if (r_ == VK_ERROR_DEVICE_LOST) ::gfx::vk_note_device_lost();                   \
         if (r_ != VK_SUCCESS) fatal("%s failed: VkResult %d (%s:%d)", #x, (int)r_, __FILE__, __LINE__); \
     } while (0)
 
@@ -40,7 +46,15 @@ struct Image {
     Use use = Use::NONE;
     bool cube = false;  // created cube compatible
     std::vector<VkImageView> attachViews;  // per layer, for rendering
+    // A clear not recorded yet (vk_device.cpp, clear_surface): the next render pass that renders to
+    // a pending layer clears it as it begins (LOAD_OP_CLEAR) instead of the clear being written to
+    // memory and the pass reading it back. Any other use records it first (prepare).
+    uint32_t pendingClearLayers = 0;          // bit per layer (mip 0)
+    VkImageAspectFlags pendingClearAspect = 0;
+    VkClearValue pendingClearValue{};
 };
+// records the image's deferred clear now (any use other than the render pass that takes it over)
+void flush_pending_clear(Image& img);
 
 // A host image backing a guest surface (render target, depth buffer or sampled texture).
 struct Surface {
@@ -57,6 +71,7 @@ struct Surface {
     uint64_t contentHash = 0;  // hash of guest data at last upload
     uint64_t lastCheckedFrame = ~0ull;
     uint64_t sparseHash = 0;   // cheap per-frame change check (a few hundred samples)
+    uint32_t checkGen = 0;     // write tracking (mem_writes.h) when the contents were last compared
     uint32_t dataSize = 0;     // base level size in guest memory
     bool dirty = true;         // new, or invalidated by the game: do a full check
     FormatInfo fmt;
@@ -65,9 +80,14 @@ struct Surface {
     Surface* feedbackCopy = nullptr;  // copy sampled while this surface is a bound attachment
     Surface* mipChain = nullptr;      // a rendered picture with coarser levels, for sampling with mips
     uint64_t mipChainSeq = ~0ull;     // writeSeq of the source when mipChain was last built
+    Surface* volume = nullptr;        // a render target with slices, as the 3D texture the game samples
+    uint64_t volumeSeq = ~0ull;       // writeSeq of the source when volume was last copied
+    bool aliased = false;             // another colour surface of the same texel bits shares the address
+    uint64_t writtenBackSeq = 0;      // linear render targets: writeSeq when last written to guest memory
     uint64_t lastDrawFrame = ~0ull;   // render targets: the last frame drawn into,
     uint32_t drawStreak = 0;          // and in how many consecutive frames up to it
     bool firstDrawFrame = false;      // lastDrawFrame is the first frame it was drawn into
+    bool sceneScale = false;          // private copies that must follow the scene's resolution (never the bloom size)
 };
 
 // A display output: the TV or the GamePad screen, composed into the Android surface.
@@ -102,8 +122,12 @@ struct Renderer {
     bool mirrorClampToEdge = false;
     bool uploadCached = false;   // transient upload memory is CPU-cached (copy_deduped compares in it)
     bool shaderFloat16 = false;  // 16-bit float arithmetic in shaders (frame generation)
+    uint32_t vertexCpuClasses = 0;  // vertex attributes decoded on the CPU (vertex_cpu_policy.h; PowerVR)
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     std::mutex queueMutex;  // vkQueueSubmit/Present from the render thread, waits from the UI thread
+    // vkAcquireNextImageKHR (render thread) and vkQueuePresentKHR (record thread) on the same swapchain
+    // need external synchronization; taken before queueMutex
+    std::mutex swapchainMutex;
 
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;  // recording, or null
@@ -137,6 +161,12 @@ VkDescriptorSet alloc_descriptor_set(VkDescriptorSetLayout layout);
 uint32_t& draws_since_commit();  // draws recorded since the last submission
 // make an image ready for `use` (records a barrier; ends the render pass if needed)
 void prepare(Image& img, Use use);
+// draws into the GamePad picture while no layout shows it are left out (vk_device.cpp)
+bool skip_hidden_drc_draw(uint32_t guestWidth, uint32_t guestHeight);
+bool drc_shown();  // the GamePad picture is on screen somewhere
+// Graphics setting: the far shadow cascade drawn (vk_draw.cpp)
+bool distant_shadows();
+void set_distant_shadows(bool v);
 
 // a surface was added or its data size changed (invalidate's address index)
 void surfaces_changed();
@@ -172,6 +202,7 @@ Surface* depth_target(const uint32_t* regs, uint32_t* slice = nullptr);         
 Surface* surface_from_color_buffer(uint32_t gx2ColorBuffer, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
 Surface* surface_from_depth_buffer(uint32_t gx2DepthBuffer, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
 Surface* sampled_texture(const uint32_t* texWords, bool isDepthSampler);  // from SQ_TEX_RESOURCE words
+void write_back_linear();  // GX2DrawDone: render results the CPU reads, to guest memory
 void upload_surface(Surface* s);
 // a private image like `like` (render targets the game doesn't know about)
 bool create_surface_image(Surface* s, bool forRendering);
@@ -183,6 +214,15 @@ void latch_resolution_scale();  // frame boundary (swap)
 Surface* rescaled(Surface* s);
 // forget everything that refers to `old` and free it once the GPU is done with it
 void retire_image(const Image& old);
+// HUD coverage for 60 fps (generated) (vk_draw.cpp): begins at the first TV layout of a frame; the
+// frame's coverage once every HUD draw wrote it (else null)
+void hud_coverage_begin(Surface* tv);
+Image* hud_coverage(uint64_t frame);
+void retire_images(const std::vector<Image>& olds);  // several at once (one cache flush)
+void evict_unused_textures();  // frame boundary: textures the game hasn't sampled for minutes
+// a save state was loaded (gx2_ss_load, the GPU idle): the shader program hashes remembered by
+// address are forgotten (vk_draw.cpp; ss_reset_surfaces calls it)
+void ss_reset_programs();
 
 // ---- shaders (vk_shader.cpp)
 void shader_compiler_init();

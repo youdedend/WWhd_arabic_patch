@@ -13,21 +13,21 @@ on:
   workflow_dispatch:
     inputs:
       versionName:
-        description: 'Version name (android/app/build.gradle default is 0.6)'
-        default: '0.6'
+        description: 'Version name (android/app/build.gradle default is 1.14)'
+        default: '1.14'
       versionCode:
         description: 'Version code (raise with every APK you share)'
-        default: '6'
+        default: '14'
   push:
-    branches: [main, master, port-0.2.8]
+    branches: [main, master, port-0.2.8, 'arena/*']
 
 jobs:
   apk:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
-      VERSION_NAME: ${{ inputs.versionName || '0.7' }}
-      VERSION_CODE: ${{ inputs.versionCode || '7' }}
+      VERSION_NAME: ${{ inputs.versionName || '1.14' }}
+      VERSION_CODE: ${{ inputs.versionCode || '14' }}
     steps:
       - uses: actions/checkout@v4
 

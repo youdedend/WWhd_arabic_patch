@@ -11,15 +11,30 @@
 // creation, cCt_Counter) and fpcEx_Handler (every process: Link, door, camera, event manager in the
 // play scene). Drawing, process deletion (fpcDt_Handler: its timers count drawn frames, see
 // turbo_steps.h), scene management (fapGm_After) and the pad read stay once per frame. Button
-// presses ("trigger" bits) are cleared for the extra steps, so a press is seen once.
+// presses ("trigger" bits) are cleared for the extra steps, so a press is seen once. While a weather
+// effect (spores, rain, fog, ...) drains or deletes its packet, the frame gets no more extra steps:
+// that countdown also counts drawn frames (weather_teardown, original project 9adbe94, its issue #145).
 //
 // Fast scene changes: while an overlap (fade/wipe) process exists (l_fopOvlpM_overlap[0],
-// 101F36CC), the frame gets kSceneExtra more runs of the transition machinery only: process
-// creation (fpcCt_Handler: the new scene's loading phases), the overlap process's execute (its fade
-// timers) and fapGm_After (scene and overlap request phases). The scenes themselves (actors,
+// 101F36CC), the frame gets kSceneExtra more runs of the transition machinery only: the overlap
+// process's execute (its fade timers) and fapGm_After (scene and overlap request phases). Process
+// creation (fpcCt_Handler) stays once per frame: run in the extra steps too, the new scene's actors
+// were created ahead of the frames they normally get, and grandma kept her back to Link while
+// handing over the shield (issue #15). It made scene changes only ~3 frames shorter. The scenes themselves (actors,
 // events, cutscenes) keep running at normal speed, so no story event is shortened.
 //
-// Both act on full logic passes only (not on the 60 fps in-between passes) and in all 60 fps modes.
+// Fast forward: while ZR is held during an event, the emulated display clock runs kFfRate times
+// as fast (gx2::set_clock_rate), so the game plays whole frames faster: every frame is calculated
+// and drawn as usual, so nothing differs from normal play but the speed, which the device's
+// rendering limits. (Extra logic steps between two drawn frames, as quick doors uses, halted the
+// game in cutscenes: J3DPacket "mEntryPtr == 0" when a model was created in such a step.) The event
+// controller's mode (dEvt_control_c::mMode) says what runs: 1 a dialogue (talk event), 2 or 3 a
+// cutscene (demo or compulsory event, also the messages inside it). Cutscenes and dialogues are
+// switched separately. Text boxes still wait for their button.
+//
+// All act on full logic passes only (not on the 60 fps in-between passes) and in all 60 fps modes.
+#include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +43,9 @@
 #include "turbo_steps.h"
 #include "runtime.h"
 #include "../release.h"
+
+namespace gx2 { void set_clock_rate(double rate); }  // gx2_core.cpp
+namespace gfx { void set_fast_forward(bool on); }     // vk_device.cpp
 
 extern "C" {
 void f_025DE788_orig(Cpu* c);  // fpcEx_Handler
@@ -52,6 +70,11 @@ constexpr uint32_t kOvlpTask = 0x20;       // overlap_request_class::mpTask (fop
 const release::Data kPadPtr{0x101F5088};   // the game's pad state (pad accessors 0200763C...)
 constexpr uint32_t kCurProc = 0x65F0;      // daPy_lk_c::mCurProc
 constexpr int kDoorTalk = 16;              // dDoor_info_c action table: "TALK"
+// dComIfGp_getEvent(): the play info (1046F0B0, from the getter 025200D4) + 0x51D0, as
+// dEvent_manager_c::runProc (02544374) passes it to dEvt_control_c::check
+const release::Data kEvtCtrl{0x10474280};
+const release::Data kCounter{0x101FF558};  // g_Counter.mCounter0: +1 per logic step
+constexpr uint32_t kEvtMode = 0xC2;        // dEvt_control_c::mMode (as on GameCube)
 
 int env_i(const char* n, int d) {
     const char* e = getenv(n);
@@ -59,6 +82,46 @@ int env_i(const char* n, int d) {
 }
 const int kDoorExtra = env_i("WWHD_MOD_DOOR_EXTRA", 3);    // 4 logic steps per frame
 const int kSceneExtra = env_i("WWHD_MOD_SCENE_EXTRA", 3);  // 4 transition steps per frame
+const double kFfRate = env_i("WWHD_MOD_FF_RATE", 4);     // display clock rate while fast forwarding
+
+// The weather effects keep the rule of process deletion (see the quick doors' loop) with a countdown
+// of their own: rain, stars, spores (housi), fog (moya) and waves each have a phase byte in
+// g_env_light (dKyw_wether_move_draw 0257ACAC, enum WeatherPhase): 0 create, 1 move (the only phase
+// whose packet is drawn), 2 drain, 3 delete (the packet is destroyed at once, not through the delete
+// queue). In the game a draw falls between the packet's last entry and its destruction. Leaving a
+// Forbidden Woods spore room through a door ran that countdown within one frame of extra steps:
+// "PROGRAM HALT J3DPacket.cpp:157 mEntryPtr == (0)". While any effect drains or deletes, the frame
+// gets no more extra steps. Same offsets in USA, EUR and JPN. WWHD_MOD_DOOR_WEATHER=0: the old
+// behaviour, for A/B runs.
+const release::Data kEnvLight{0x10475A68};  // g_env_light
+struct WeatherEffect {
+    const char* name;
+    uint32_t phase_off;
+};
+constexpr WeatherEffect kWeatherEffects[] = {
+    {"rain", 0xA3C}, {"star", 0xA54}, {"housi", 0xA70}, {"moya", 0xA7C}, {"wave", 0xA98},
+};
+const bool kDoorWeatherWait = env_i("WWHD_MOD_DOOR_WEATHER", 1) != 0;
+const WeatherEffect* weather_teardown() {
+    for (const WeatherEffect& w : kWeatherEffects) {
+        const uint8_t phase = ld8(kEnvLight + w.phase_off);
+        if (phase == 2 || phase == 3) return &w;  // drain, delete
+    }
+    return nullptr;
+}
+
+// 0 no event, 1 dialogue, 2 / 3 cutscene
+int event_mode() { return ld8(kEvtCtrl + kEvtMode); }
+}  // namespace
+int event_mode_now() { return event_mode(); }
+namespace {
+// fast forward applies to the event running now
+bool ff_now() {
+    if (!ff_button()) return false;
+    int m = event_mode();
+    return m == 1 ? ff_dialogues() : (m == 2 || m == 3) ? ff_cutscenes() : false;
+}
+
 // debug: WWHD_MOD_DOOR_DELETE=1 runs process deletion in the extra steps too (the behaviour before
 // the fix of issue #61, for A/B runs: it can delete a process whose packets are still listed)
 const StepParts kDoorStep = [] {
@@ -147,7 +210,7 @@ void call(Cpu* c, void (*f)(Cpu*), uint32_t r3) {
 // function is FN for deletion (fopAcM_delete) right after the first logic step of each door event,
 // as an actor deleting itself in that step would (a rat going into its hole, a pot breaking, Tingle
 // leaving). FN=list traces the actors (execute function, position) instead.
-const release::Data kActorQueue{0x101F3328};  // g_fopAcTg_Queue (fopAcIt_Executor 025D51DC)
+constexpr uint32_t kActorQueue = 0x101F3328;  // g_fopAcTg_Queue (fopAcIt_Executor 025D51DC)
 uint32_t actor_execute(uint32_t a) {
     uint32_t sub = ld32(a + 0xF0);  // fopAc_ac_c::sub_method (true60.cpp kSubMethod)
     return sub >= 0x10000000 && sub < 0x50000000 ? ld32(sub + 8) : 0;
@@ -195,6 +258,35 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
         ovl = !ovl;
         trace("overlap (fade) %s", ovl ? "starts" : "ends");
     }
+    static int mode = 0;
+    if (event_mode() != mode) {
+        mode = event_mode();
+        LOG("[mods] event mode %d", mode);
+    }
+    // fast forward: the display clock runs faster (gx2_core.cpp), so whole frames come faster
+    bool ff = ff_now();
+    static bool ff_was = false;
+    if (ff != ff_was) {
+        ff_was = ff;
+        gx2::set_clock_rate(ff ? kFfRate : 1.0);
+#ifdef __ANDROID__
+        gfx::set_fast_forward(ff);  // frame generation would pace the game to its own rate
+#endif
+        // the speed reached: game frames per second of real time, against the normal 30
+        static uint32_t f0 = 0;
+        static std::chrono::steady_clock::time_point t0;
+        uint32_t frames = ld32(kCounter);
+        auto now = std::chrono::steady_clock::now();
+        if (ff) {
+            f0 = frames;
+            t0 = now;
+            LOG("[mods] fast forward on (event mode %d)", mode);
+        } else {
+            double s = std::chrono::duration<double>(now - t0).count();
+            LOG("[mods] fast forward off (event mode %d): %u frames in %.1f s, %.1fx", mode, frames - f0, s,
+                s > 0 ? (frames - f0) / s / 30.0 : 0.0);
+        }
+    }
     uint32_t lr = c->lr, r3 = c->r[3];
     // quick doors: whole logic steps
     if (quick_doors()) {
@@ -202,6 +294,10 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
         uint32_t saved[sizeof kTrigWords / sizeof *kTrigWords];
         bool cleared = false;
         for (int i = 0; i < kDoorExtra && door; i++) {
+            if (const WeatherEffect* w = kDoorWeatherWait ? weather_teardown() : nullptr) {
+                trace("extra steps wait: %s packet tearing down (phase %u)", w->name, ld8(kEnvLight + w->phase_off));
+                break;
+            }
             if (pad && !cleared) {
                 for (size_t k = 0; k < sizeof kTrigWords / sizeof *kTrigWords; k++) {
                     saved[k] = ld32(pad + kTrigWords[k]);
@@ -228,7 +324,7 @@ void after_execute(Cpu* c, uint32_t execute_fn) {
     // fast scene changes: transition machinery only
     if (fast_scenes()) {
         for (int i = 0; i < kSceneExtra && overlap_active(); i++) {
-            call(c, f_025DDCEC_orig, 0);  // fpcCt_Handler: loading phases of the new scene
+            // (no fpcCt_Handler: process creation stays once per frame, see the top, issue #15)
             uint32_t ovl_req = ld32(kOverlap);
             uint32_t task = ovl_req ? ld32(ovl_req + kOvlpTask) : 0;
             if (task) call(c, f_025DF940, task);  // the overlap process: fade timers
@@ -249,6 +345,12 @@ void link_executed(uint32_t link) {
         trace("link proc %u -> %u", last, p);
         last = p;
     }
+}
+
+// a save state was loaded (savestate.cpp): a door event going on at this moment isn't in the loaded one
+void turbo_ss_reset() {
+    g_door_cut = g_door_event = false;
+    g_door_action = -1;
 }
 
 }  // namespace mods

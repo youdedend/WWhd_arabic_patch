@@ -19,6 +19,10 @@ final class Native {
     static native void setCrashInfo(String section, String text);
     /** The same from a Cemu .wua archive (decrypted, no keys). */
     static native String extractArchive(int fd, String outDir);
+    /** A mod folder whose content/ files replace the game's (before start; "" = none). */
+    static native void setContentOverlay(String dir);
+    /** The HUD editor: per part {left, bottom, right, top} in layout units (NaN: not drawn yet), then kx, ky. */
+    static native float[] hudBounds();
     /** {bytes written, total} of the running extraction. */
     static native long[] extractProgress();
     static native void extractCancel();
@@ -49,6 +53,14 @@ final class Native {
     static native String gpuName();
     /** True if the chosen installed driver couldn't be loaded and the system's runs instead. */
     static native boolean gpuDriverFellBack();
+
+    /** The icon font's glyph cells for `codes` (ui_icons.cpp): 8-byte header (cell width, height, little-endian) and RGBA8 cells; null if unsupported. */
+    static native byte[] fontCells(byte[] font, int[] codes);
+    /** Writes RGBA8 cells (as fontCells returns them, without the header) into `font`, in place. */
+    static native boolean patchFontCells(byte[] font, int[] codes, byte[] cells);
+
+    /** The shader cache's replay at start: {state (0 not started, 1 loading, 2 done), bytes read, file size, shaders prepared}. */
+    static native long[] cacheProgress();
     /** Why frame generation couldn't start, or "" (it runs, or it is off). */
     static native String frameGenError();
 
@@ -58,6 +70,9 @@ final class Native {
     static native void drcSurfaceChanged(Object surface);
     /** Screen rectangles in surface pixels: {x, y, w, h}. */
     static native void setLayout(float[] tv, float[] drc, boolean drcVisible);
+    /** a game menu is open (hybrid layout: the GamePad is shown full screen then) */
+    static native boolean menuOpen();
+    static native boolean batonUp();  // the Wind Waker's songs (hybrid layout: the GamePad as an inset)
 
     static native void setPad(int buttons, float lx, float ly, float rx, float ry);
     /** Touch on the GamePad screen, 0..1 from the top left. */
@@ -67,24 +82,24 @@ final class Native {
 
     /**
      * ao_mode (0..2), ao_hires, aniso, pro_controller (0/1); capture (any value); gameplay mods:
-     * mod_direct_camera, mod_camera_speed (percent), mod_first_person, mod_climb, mod_quick_doors, mod_fast_scenes,
+     * mod_direct_camera, mod_camera_speed (percent), mod_first_person, mod_climb, mod_quick_doors, mod_fast_scenes, mod_ff_cutscenes, mod_ff_dialogues,
      * mod_run_speed (percent), mod_run_mode (0 always, 1 hold L3, 2 L3 switches), mod_swim_speed (percent), mod_swim_mode (as run).
-     * arabic (0/1); arabic_ready reads back bit 0 = translated text, bit 1 = title logo.
      */
     static native void setOption(String name, int value);
     static native int getOption(String name);
+    /** game state for the touch controls: {flags, A action, B action, ZR action, X, Y, R item} */
+    static native int[] hudState();
+    /** gyro aiming: a sensor sample in GamePad axes (rad/s, m/s^2, ns), on/off, recentre */
+    /** decodes game textures to outDir/<texture>.rgba (IconForge); returns how many */
+    static native int extractUiTextures(String gameDir, String outDir, String[] layouts, String[] textures);
 
-    /** Save state slot 1..5: {used, compatible, time, area, controller, portable} ("1"/"0" flags). */
+    /** Save state slot 1..5: {used "1"/"0", compatible "1"/"0", time, area}. */
     static native String[] saveSlotInfo(int slot);
     /** Saved / loaded at the next frame boundary; the result shows in saveStateMessage(). */
     static native void saveState(int slot);
     static native void loadState(int slot);
     /** The latest save state result, "" when stale. */
     static native String saveStateMessage();
-    /** Portable state for a bug report (states/bugreport.wwstate), saved at the next frame boundary. */
-    static native void saveBugReportState();
-    /** {newest portable state path, cking.sav path} ("" parts if missing). */
-    static native String[] bugReportFiles();
     /** Frame generation settings; applied from the next frame on (the DLL is read again). */
     static native void applyFrameGen(boolean on, String dll, boolean quality, float flowScale, int multiplier, boolean uiDetection);
     /** Performance overlay: {game fps, frame time avg ms, worst ms, presented fps, frame generation GPU ms}. */

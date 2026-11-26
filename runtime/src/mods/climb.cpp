@@ -29,6 +29,7 @@
 // - True 60 (key 7): the climbing procedures (0x3D-0x40) are not in true60's 60 Hz list, so they
 //   stay at 30 Hz; stamina is counted per original step (true60::dt()).
 #include "mods/climb.h"
+#include "mods/mods.h"
 
 #include <algorithm>
 #include <atomic>
@@ -108,7 +109,7 @@ bool debug() {
     return d;
 }
 
-bool b_held() { return (input::read().buttons & input::kB) != 0; }
+bool b_held() { return (input::read(false).buttons & input::kB) != 0; }
 }  // namespace
 
 namespace mods {
@@ -118,6 +119,14 @@ void set_climb_enabled(bool on) {
     LOG("[climb] climb any wall %s", on ? "on" : "off");
 }
 ClimbHud climb_hud() { return {g_stamina.load(), g_alpha.load(), g_exhausted.load()}; }
+// a save state was loaded (savestate.cpp): the climb, or the wait after letting go, going on at
+// this moment isn't in the loaded one (the stamina is the player's and stays)
+void climb_ss_reset() {
+    g_convert = g_converted = false;
+    g_fake = g_block = false;
+    g_block_time = g_climb_time = 0;
+    g_prev_proc = -1;
+}
 }  // namespace mods
 
 // ---- dBgS::GetWallCode(cBgS_PolyInfo&) (024EF080): a plain wall reads as ivy (code 1) while
@@ -248,7 +257,9 @@ extern "C" void hook_02429408(Cpu* c) {
 // ---- daPy_lk_c::execute (0240CDD0): stamina, re-grab block, HUD state ----
 extern "C" void hook_0240CDD0(Cpu* c) {
     uint32_t self = c->r[3];
+    mods::moon_jump_step(c, self, true);  // the moon jump cheat (cheats.cpp)
     f_0240CDD0_orig(c);
+    mods::moon_jump_step(c, self, false);
     if (!g_on) {
         g_stamina = 1.0f;
         g_alpha = 0.0f;

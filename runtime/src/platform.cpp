@@ -1,8 +1,17 @@
 // Host OS services: macOS (Mach) and Android/Linux implementations.
 #include "platform.h"
+#include "crash_info.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sched.h>
+#include <dirent.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,8 +31,11 @@
 #endif
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <sched.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <mutex>
 #include <vector>
 #endif
@@ -48,6 +60,10 @@ void thread_stack_bounds(uintptr_t& lo, uintptr_t& hi) {
 #endif
 }
 
+#ifdef __ANDROID__
+static void drop_inherited_big_cores();
+#endif
+
 void set_thread_name(const char* name) {
 #ifdef __APPLE__
     pthread_setname_np(name);
@@ -55,6 +71,9 @@ void set_thread_name(const char* name) {
     char n[16];
     snprintf(n, sizeof n, "%s", name);
     pthread_setname_np(pthread_self(), n);
+#endif
+#ifdef __ANDROID__
+    drop_inherited_big_cores();  // every thread names itself first thing
 #endif
 }
 
@@ -72,15 +91,82 @@ struct Adpf {
     APerformanceHintSession* (*createSession)(APerformanceHintManager*, const int32_t*, size_t, int64_t);
     int (*reportActual)(APerformanceHintSession*, int64_t);
     int (*setThreads)(APerformanceHintSession*, const int32_t*, size_t);  // Android 14+, may be null
+    int (*updateTarget)(APerformanceHintSession*, int64_t);
     APerformanceHintSession* session = nullptr;
     bool ok = false, failed = false;
-    int64_t targetNs = 26000000;
+    int64_t targetNs = 26000000;  // per game frame at 30 fps
+    int64_t currentNs = 0;        // the session's target: per frame shown (frame interpolation divides it)
 };
 Adpf g_adpf;
 std::mutex g_hint_mu;
 std::vector<int32_t> g_hint_tids;  // threads of the session, and those still to add
 std::vector<uint64_t> g_hint_cpu;   // CPU time of each at the last frame, ns
 bool g_hint_changed = false;
+
+// ---- big cores (prefer_big_cores): applied once the session is known to be missing
+std::vector<int32_t> g_big_tids;  // threads that asked
+std::atomic<int> g_big_state{0};  // 0 undecided, 1 applied, -1 not applied (session, setting, one cluster)
+cpu_set_t g_big_set;
+int big_cores_mode() {
+    static const int m = [] { const char* e = getenv("WWHD_BIG_CORES"); return e ? atoi(e) : 1; }();
+    return m;
+}
+std::atomic<bool> g_pinned_any{false};  // a thread's affinity was set (new threads drop what they inherit)
+// the game thread on the fastest cores while frame interpolation is on (WWHD_FAST_CORE=0: never)
+int32_t g_game_tid = 0;
+bool g_game_fast = false;
+// the cores above the slowest cluster (by maximum clock), or only the fastest; false on
+// single-cluster devices
+bool find_big_cores(cpu_set_t& set, char* desc, size_t descSize, bool fastest = false) {
+    long maxf[CPU_SETSIZE] = {};
+    long lo = 0, hi = 0;
+    int n = 0;
+    for (int c = 0; c < 64; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%ld", &maxf[c]) != 1) maxf[c] = 0;
+        fclose(f);
+        if (maxf[c] > 0 && (!lo || maxf[c] < lo)) lo = maxf[c];
+        hi = std::max(hi, maxf[c]);
+        n = c + 1;
+    }
+    CPU_ZERO(&set);
+    size_t at = 0;
+    desc[0] = 0;
+    for (int c = 0; c < n; c++)
+        if (fastest ? maxf[c] == hi && hi > lo : maxf[c] > lo) {
+            CPU_SET(c, &set);
+            at += snprintf(desc + at, at < descSize ? descSize - at : 0, "%s%d", at ? "," : "", c);
+        }
+    return CPU_COUNT(&set) > 0;
+}
+void big_cores_apply(int32_t tid) {
+    g_pinned_any = true;
+    if (sched_setaffinity(tid, sizeof g_big_set, &g_big_set) != 0) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "[perf] big cores: thread %d refused (%s)", tid, strerror(errno));
+        log_line(msg);
+    }
+}
+// called under g_hint_mu once the session's fate is known
+void big_cores_decide(bool session) {
+    if (g_big_state) return;
+    const int mode = big_cores_mode();
+    char desc[128];
+    if (mode == 0 || (mode == 1 && session) || !find_big_cores(g_big_set, desc, sizeof desc)) {
+        g_big_state = -1;
+        return;
+    }
+    g_big_state = 1;
+    for (int32_t t : g_big_tids)
+        if (t != g_game_tid || !g_game_fast) big_cores_apply(t);  // (interpolation: the fastest cores already)
+    char msg[192];
+    snprintf(msg, sizeof msg, "[perf] big cores: game and render thread kept on cores %s (%s)", desc,
+             session ? "WWHD_BIG_CORES=2" : "no performance hint session");
+    log_line(msg);
+}
 
 bool adpf_load() {
     if (g_adpf.ok || g_adpf.failed) return g_adpf.ok;
@@ -97,6 +183,7 @@ bool adpf_load() {
     g_adpf.createSession = (decltype(g_adpf.createSession))dlsym(lib, "APerformanceHint_createSession");
     g_adpf.reportActual = (decltype(g_adpf.reportActual))dlsym(lib, "APerformanceHint_reportActualWorkDuration");
     g_adpf.setThreads = (decltype(g_adpf.setThreads))dlsym(lib, "APerformanceHint_setThreads");
+    g_adpf.updateTarget = (decltype(g_adpf.updateTarget))dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
     if (!g_adpf.getManager || !g_adpf.createSession || !g_adpf.reportActual) {
         log_line("[perf] performance hints unavailable (Android 12 or older)");
         return false;
@@ -115,9 +202,41 @@ uint64_t tid_cpu_ns(int32_t tid) {
 }
 }  // namespace
 
-void perf_hint_frame() {
+// Frame interpolation needs the game thread's logic pass within one vsync tick. The scheduler places it
+// by load, which is lower at 30 fps: on the tablet it then stayed on the 2.6 GHz cores (logic pass 15
+// ms CPU) instead of the 2.8 GHz prime core (11 ms), and paced interpolation left out every in-between
+// frame for good. So while interpolation is on, the game thread is kept on the fastest cores (tablet
+// and Mi 9: the prime core; Moto G24: the two big ones): tablet 60 fps, 100% of the in-between frames.
+void game_fast_cores(bool on) {
+    static const bool allowed = !getenv("WWHD_FAST_CORE") || atoi(getenv("WWHD_FAST_CORE")) != 0;
+    if (!allowed || !g_game_tid || on == g_game_fast) return;
+    cpu_set_t set;
+    char desc[128];
+    if (on && !find_big_cores(set, desc, sizeof desc, true)) return;
+    if (!on) {
+        if (g_big_state == 1) set = g_big_set;
+        else {
+            CPU_ZERO(&set);
+            for (int c = 0, n = (int)sysconf(_SC_NPROCESSORS_CONF); c < n && c < CPU_SETSIZE; c++) CPU_SET(c, &set);
+        }
+    }
+    g_pinned_any = true;
+    g_game_fast = on;
+    if (sched_setaffinity(g_game_tid, sizeof set, &set) != 0) return;
+    char msg[160];
+    if (on) snprintf(msg, sizeof msg, "[perf] frame interpolation: game thread kept on the fastest cores (%s)", desc);
+    else snprintf(msg, sizeof msg, "[perf] frame interpolation off: game thread placed as before");
+    log_line(msg);
+}
+
+void perf_hint_frame(int framesPerStep) {
     std::lock_guard<std::mutex> lk(g_hint_mu);
-    if (!adpf_load() || g_hint_tids.empty()) return;
+    game_fast_cores(framesPerStep > 1);
+    if (!adpf_load()) {
+        big_cores_decide(false);
+        return;
+    }
+    if (g_hint_tids.empty()) return;
     // CPU time of each thread since the last frame; drop threads that have exited
     int64_t busiest = 0;
     for (size_t i = 0; i < g_hint_tids.size();) {
@@ -134,13 +253,16 @@ void perf_hint_frame() {
     }
     if (!g_adpf.session) {
         APerformanceHintManager* m = g_adpf.getManager();
+        g_adpf.currentNs = g_adpf.targetNs;
         g_adpf.session = m ? g_adpf.createSession(m, g_hint_tids.data(), g_hint_tids.size(), g_adpf.targetNs) : nullptr;
         if (!g_adpf.session) {
             log_line("[perf] performance hint session refused");
             g_adpf.ok = false;
             g_adpf.failed = true;
+            big_cores_decide(false);
             return;
         }
+        big_cores_decide(true);
         char msg[96];
         snprintf(msg, sizeof msg, "[perf] performance hint session: %zu threads, target %.1f ms", g_hint_tids.size(),
                  g_adpf.targetNs / 1e6);
@@ -149,6 +271,17 @@ void perf_hint_frame() {
         return;
     }
     if (g_hint_changed && g_adpf.setThreads) g_adpf.setThreads(g_adpf.session, g_hint_tids.data(), g_hint_tids.size());
+    // Frame interpolation shows framesPerStep frames per 30 Hz step: the target per frame is that much
+    // shorter. With the 30 fps target, the tablet lowered its clocks once paced interpolation left out
+    // the in-between frames, and they never fit again (logic pass 11 -> 15 ms CPU).
+    const int64_t target = g_adpf.targetNs / std::max(1, framesPerStep);
+    if (target != g_adpf.currentNs) {
+        int r = g_adpf.updateTarget ? g_adpf.updateTarget(g_adpf.session, target) : -1;
+        char msg[96];
+        snprintf(msg, sizeof msg, "[perf] performance hint target %.1f ms%s (%d)", target / 1e6, r == 0 ? "" : " refused", r);
+        log_line(msg);
+        g_adpf.currentNs = target;  // (refused: not asked again)
+    }
     g_hint_changed = false;
     if (busiest > 0) g_adpf.reportActual(g_adpf.session, busiest);
     static const bool logIt = getenv("WWHD_PERF_LOG") != nullptr;
@@ -169,8 +302,26 @@ static void perf_hint_add_thread() {
     g_hint_cpu.push_back(0);
     g_hint_changed = true;
 }
+// A new thread inherits its creator's affinity: threads the game or render thread starts (game
+// threads, shader compiles, the frame generation present thread) would crowd the big cores.
+static void drop_inherited_big_cores() {
+    if (!g_pinned_any.load(std::memory_order_relaxed)) return;
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int c = 0, n = (int)sysconf(_SC_NPROCESSORS_CONF); c < n && c < CPU_SETSIZE; c++) CPU_SET(c, &all);
+    sched_setaffinity(0, sizeof all, &all);
+}
+
+void prefer_big_cores(bool game) {
+    std::lock_guard<std::mutex> lk(g_hint_mu);
+    const int32_t tid = (int32_t)syscall(SYS_gettid);
+    if (game) g_game_tid = tid;
+    g_big_tids.push_back(tid);
+    if (g_big_state == 1) big_cores_apply(tid);
+}
 #else
-void perf_hint_frame() {}
+void perf_hint_frame(int) {}
+void prefer_big_cores(bool) {}
 #endif
 
 void set_thread_high_priority() {
@@ -186,6 +337,93 @@ void set_thread_high_priority() {
     // Android's THREAD_PRIORITY_URGENT_DISPLAY; the scheduler favours big cores for low nice values.
     // Fails quietly where the app may not raise priorities.
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -8);
+#endif
+}
+
+// Where the render and game threads run (the app's setting): 0 automatic (the system decides), 1 the
+// performance cores (neither the efficiency cores nor the prime core: the best performance per
+// watt, so the least heat), 2 the prime core for the render thread (the fastest single core, and
+// the hottest), 3 the prime core for the game thread and the performance cores for the render thread
+// (when the game's own logic is the slower of the two). Applied by the threads themselves when they
+// call apply_thread_cores.
+static std::atomic<int> g_core_mode{getenv("WWHD_CORE_MODE") ? atoi(getenv("WWHD_CORE_MODE")) : 0};
+void set_core_mode(int m) { g_core_mode = std::clamp(m, 0, 3); }
+int core_mode() { return g_core_mode; }
+
+#if defined(__ANDROID__)
+namespace {
+struct CoreSets {
+    cpu_set_t all, prime, perf;
+    int nPrime = 0, nPerf = 0;
+    bool clusters = false;  // more than one kind of core
+};
+// clusters by maximum clock: the highest is the prime core(s), the lowest the efficiency cores
+const CoreSets& core_sets() {
+    static CoreSets c = [] {
+        CoreSets r;
+        long freq[64] = {}, best = 0, low = 0;
+        int n = 0;
+        for (; n < 64; n++) {
+            char path[96];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+            FILE* f = fopen(path, "r");
+            if (!f) break;
+            if (fscanf(f, "%ld", &freq[n]) != 1) freq[n] = 0;
+            fclose(f);
+            best = std::max(best, freq[n]);
+            low = n == 0 ? freq[n] : std::min(low, freq[n]);
+        }
+        CPU_ZERO(&r.all);
+        CPU_ZERO(&r.prime);
+        CPU_ZERO(&r.perf);
+        for (int i = 0; i < n; i++) {
+            CPU_SET(i, &r.all);
+            if (freq[i] == best) { CPU_SET(i, &r.prime); r.nPrime++; }
+            else if (freq[i] != low) { CPU_SET(i, &r.perf); r.nPerf++; }
+        }
+        r.clusters = best > 0 && r.nPrime < n;
+        if (r.nPerf == 0) { r.perf = r.prime; r.nPerf = r.nPrime; }  // two clusters: the big one
+        return r;
+    }();
+    return c;
+}
+}  // namespace
+#endif
+
+void apply_thread_cores(bool render) {
+#if defined(__ANDROID__)
+    const CoreSets& c = core_sets();
+    if (!c.clusters) return;
+    int mode = g_core_mode.load();
+    static thread_local int applied = 0;  // the mode this thread last applied (0: nothing yet)
+    // automatic: the system decides, and prefer_big_cores where there's no performance hint
+    // session; only a switch back from another mode gives the thread every core again
+    if (mode == 0 && applied == 0) return;
+    const cpu_set_t* want = &c.all;
+    if (mode == 1) want = &c.perf;
+    else if (mode == 2 && render) want = &c.prime;
+    else if (mode == 3) want = render ? &c.perf : &c.prime;
+    cpu_set_t now;
+    bool same = sched_getaffinity(0, sizeof now, &now) == 0 && CPU_EQUAL(&now, want);
+    if (same && applied == mode) return;
+    if (!same && sched_setaffinity(0, sizeof *want, want) != 0) return;
+    if (applied != mode) {
+        const char* where = want == &c.prime ? "the prime core" : want == &c.perf ? "the performance cores" : "every core";
+        __android_log_print(ANDROID_LOG_INFO, "wwhd", "[platform] %s thread on %s", render ? "render" : "game", where);
+    }
+    applied = mode;
+    if (want == &c.all) return;
+    // threads created from the render thread (driver threads) inherit its affinity: every core back
+    if (DIR* d = opendir("/proc/self/task")) {
+        pid_t tid = (pid_t)syscall(SYS_gettid);
+        while (dirent* e = readdir(d)) {
+            pid_t t = (pid_t)atoi(e->d_name);
+            cpu_set_t a;
+            if (t <= 0 || t == tid || sched_getaffinity(t, sizeof a, &a) != 0 || !CPU_EQUAL(&a, want)) continue;
+            sched_setaffinity(t, sizeof c.all, &c.all);
+        }
+        closedir(d);
+    }
 #endif
 }
 
@@ -225,6 +463,51 @@ bool map_fixed(void* addr, size_t size) {
 #endif
 }
 
+namespace {
+// lines of a /proc file, and the number after a "Key:" in it (-1 if missing); no allocation
+long proc_lines(const char* path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char b[4096];
+    long n = 0;
+    ssize_t r;
+    while ((r = read(fd, b, sizeof b)) > 0)
+        for (ssize_t i = 0; i < r; i++) n += b[i] == '\n';
+    close(fd);
+    return n;
+}
+long proc_value(const char* path, const char* key) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char b[4096];
+    ssize_t r = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (r <= 0) return -1;
+    b[r] = 0;
+    const size_t kl = strlen(key);
+    for (char* p = b; *p; p++) {
+        if ((p == b || p[-1] == '\n') && !strncmp(p, key, kl)) {
+            p += kl;
+            while (*p == ' ' || *p == '\t' || *p == ':') p++;
+            return strtol(p, nullptr, 10);
+        }
+    }
+    return -1;
+}
+}  // namespace
+
+int process_numbers(char* buf, int size) {
+    long maps = proc_lines("/proc/self/maps"), limit = proc_value("/proc/sys/vm/max_map_count", "");
+    long threads = proc_value("/proc/self/status", "Threads"), rss = proc_value("/proc/self/status", "VmRSS"),
+         vsz = proc_value("/proc/self/status", "VmSize");
+    char lim[40];
+    if (limit > 0) snprintf(lim, sizeof lim, "limit %ld", limit);
+    else snprintf(lim, sizeof lim, "limit not readable, usually 65530");  // apps may not read it (SELinux)
+    int n = snprintf(buf, size, "%ld memory mappings (%s), %ld threads, RSS %ld MB, address space %ld MB", maps, lim, threads,
+                     rss < 0 ? -1 : rss / 1024, vsz < 0 ? -1 : vsz / 1024);
+    return n < 0 ? 0 : std::min(n, size - 1);
+}
+
 void log_line(const char* line) {
 #ifdef __ANDROID__
     __android_log_write(ANDROID_LOG_INFO, "wwhd", line);
@@ -260,7 +543,10 @@ void print_backtrace(int fd) {
         Dl_info info{};
         char buf[512];
         int len;
-        if (dladdr(frames[i], &info) && info.dli_fname) {
+        uint32_t gf, off;
+        if (crash_info::guest_function((uintptr_t)frames[i], &gf, &off)) {
+            len = snprintf(buf, sizeof buf, "  #%02d %p game function %08X+%#x\n", i, frames[i], gf, off);
+        } else if (dladdr(frames[i], &info) && info.dli_fname) {
             // the library's name only: Android's install folders have names unique to each install
             const char* lib = strrchr(info.dli_fname, '/');
             len = snprintf(buf, sizeof buf, "  #%02d %p %s+%#lx (%s)\n", i, frames[i], info.dli_sname ? info.dli_sname : "?",
@@ -276,6 +562,35 @@ void print_backtrace(int fd) {
         if (fd >= 0) write(fd, buf, len);
     }
 #endif
+}
+
+// ---------------------------------------------------------------- the app in the background
+static std::mutex g_pause_mutex;
+static std::condition_variable g_pause_cv;
+static std::atomic<bool> g_game_paused{false};
+
+void set_game_paused(bool paused) {
+    static const bool keepRunning = getenv("WWHD_BACKGROUND_RUN") && atoi(getenv("WWHD_BACKGROUND_RUN"));
+    if (keepRunning) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pause_mutex);
+        g_game_paused.store(paused, std::memory_order_relaxed);
+    }
+    g_pause_cv.notify_all();
+}
+
+void wait_while_game_paused(bool log) {
+    if (!g_game_paused.load(std::memory_order_relaxed)) return;
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(g_pause_mutex);
+        g_pause_cv.wait(lk, [] { return !g_game_paused.load(std::memory_order_relaxed); });
+    }
+    if (!log) return;
+    char line[96];
+    snprintf(line, sizeof line, "[app] game paused in the background for %.1f s",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    log_line(line);
 }
 
 }  // namespace platform

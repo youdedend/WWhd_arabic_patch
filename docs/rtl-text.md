@@ -1,13 +1,15 @@
-# Right-to-left text (Arabic, Hebrew)
+# Right-to-left text (Arabic, Hebrew) & Hesham's Translation
 
-Fan translations into right-to-left languages work by replacing the game's 2D language pack.
-On Android the menu does it: Game > Import Arabic files (pick the translation's .zip) unpacks
-its `permanent_2d_*.pack` and `Title_00.szs`, and Game > Arabic translation switches them on
-after a restart. On desktop drop the two files into the `arabic` folder next to the save
-(`WWHD_ARABIC_DIR` overrides the folder) and restart. Either way the game loads the folder's
-pack whatever language it runs in, and the dump's own files stay untouched. A Cemu code patch
-that ships with such a translation is not needed and not used: the port shapes and orders the
-text itself.
+Fan translations into right-to-left languages work by replacing the game's 2D language pack and title logo.
+Direct support is built in for **Hesham's Arabic Translation** ([arabichesham.com](https://arabichesham.com/games/the-legend-of-zelda-the-wind-waker-hd#download)):
+
+1. Download the translation `.zip` from [Arabic Hesham](https://arabichesham.com/games/the-legend-of-zelda-the-wind-waker-hd#download).
+2. On Android, open the in-game settings: **Mods › ترجمة هشام (العربية)** (or **Game › Game language**).
+3. Tap **استيراد ملفات الترجمة (.zip)…** and pick the downloaded `.zip` file directly.
+4. The app unpacks `permanent_2d_*.pack` and `Title_00.szs` into the `arabic` directory, enables Arabic translation, and prompts to restart.
+5. On restart, the game runs fully in Arabic with right-to-left shaping, bidi text reordering, and the localized Arabic title screen!
+
+On desktop, drop `permanent_2d_*.pack` and `Title_00.szs` into the `arabic` folder next to the save (`WWHD_ARABIC_DIR` overrides the folder) and restart. Either way the game loads the folder's pack whatever language it runs in, and the dump's own files stay untouched. A Cemu code patch that ships with such a translation is not needed and not used: the port shapes and orders the text itself.
 
 ## When it is on
 

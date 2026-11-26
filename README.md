@@ -1,322 +1,657 @@
-# TLoZ:TWW HD Recompiled — Android
+# Wind Waker HD Recompiled for Android — Plus
 
-An Android port of the [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp) project:
-The Legend of Zelda: The Wind Waker HD (Wii U, USA, European and Japanese versions) as a native app for 64-bit ARM Android
-devices. The game's PowerPC code is recompiled to native ARM code, the Wii U system libraries the
-game uses are reimplemented, and its graphics run directly on Vulkan. There is no emulator in
-between.
+**The Legend of Zelda: The Wind Waker HD**, running natively on Android phones and tablets.
+This is a static recompilation of the Wii U game: its PowerPC code is turned into native ARM64 code
+on your device, and its graphics run directly on Vulkan. It is **not an emulator**.
 
-**The app contains no game files.** You bring your own copy of the game: a disc image (`.wud` or
-`.wux`) dumped from your own Wii U disc, with its keys, or a Cemu archive (`.wua`) made from it. On the first start the app extracts the game
-from it and builds the game code on your device.
+**Plus** builds on the [Enhanced](https://github.com/SSunnKing/ZeldaWWHDRecompAndroid---ENHANCED)
+fork of the [Android port](https://github.com/GreenNaugahyde/ZeldaWWHDRecompAndroid). It adds a
+built-in Brazilian Portuguese translation, an app fully translated into Portuguese, a HUD layout
+editor, `.wua` archive support, better controller support, menus that fit any screen, and fixes
+for crashes on Adreno 650 and on 6 GB phones.
 
-The original project (macOS, the 60 fps modes, decompilation tools) is described in
-[docs/original-readme.md](docs/original-readme.md); how the recompilation works in
-[docs/how-it-works.md](docs/how-it-works.md).
+> **You need your own copy of the game.** The app contains no game code, no game files and no
+> keys. You provide a dump of your own Wii U disc (`.wud` / `.wux` with its keys) or a Cemu
+> archive of it (`.wua`).
 
-## What this fork adds
+<p align="center">
+  <img src="docs/screenshots/01-outset-touch-controls.jpg" width="49%" alt="Outset Island with the touch controls">
+  <img src="docs/screenshots/02-windfall.jpg" width="49%" alt="Windfall Island">
+  <img src="docs/screenshots/03-dragon-roost-portuguese.jpg" width="49%" alt="Dragon Roost Island, dialogue in Portuguese">
+  <img src="docs/screenshots/04-forbidden-woods.jpg" width="49%" alt="Forbidden Woods">
+</p>
 
-- **Android port**: Vulkan renderer, AAudio sound, touch screen, game controllers and hardware
-  keyboards.
-- **An APK without game code**: on the first start the app extracts the game from your disc image or `.wua` archive
-  and recompiles its code on the device with LLVM (once; a few minutes on a fast phone, longer on
-  slower ones). Later starts load the
-  compiled code in about half a second. The work continues in the background with a progress
-  notification, and resumes where it stopped if the app is closed.
-- **Frame generation** with Lossless Scaling's LSFG 3 (see below): 60, 90 or 120 fps.
-- **An in-game options menu** in the style of the game's own menus, with tabs for saves, the game,
-  graphics, mods and controls, usable by touch and with a controller (see below).
-- **Save states**: five slots with a picture, time and place of each state, and the controls it was
-  saved with (GamePad or Pro Controller), which loading it switches back to. The Saves tab also
-  shares a small portable state (Link's place and Quest Log progress, no game data) with the game
-  save for bug reports (`docs/portable-save-states.md`).
-- **Import and export** of the game save and the save states to a folder of your choice.
-- **Performance overlay**: frame rate with its average, frame time, CPU and GPU load, CPU, GPU and
-  battery temperatures, the graphics settings in use, the SoC, GPU and GPU driver; you choose the
-  values and drag it where you want it.
-- **The European and Japanese versions** as well as the USA one, with all features: the game code
-  of all three is the same program at shifted addresses, and the app's hooks and mods find their
-  places in each (`tools/recomp/port_addresses.py` matches the executables; the address maps it
-  writes are in `tools/recomp/release_eur.txt` and `release_jpn.txt`).
-- **Game language**: the languages of your copy (USA: English, French, Spanish; Europe: also German
-  and Italian; Japan: Japanese), by default the device's language setting is used.
-- **Custom GPU drivers** on Adreno GPUs (see below): Mesa Turnip or newer Qualcomm drivers.
-- **Widescreen**: the game renders at the screen's shape and shows more to the sides; the HUD keeps
-  its proportions at the screen edges.
-- **The Wii U's sun and haze**: the sun's corona and lens flare (hidden behind walls and hills as on
-  the console), the haze in the distance and the bloom around bright light.
-- **Display options**: rendering resolution from 0.5× to 3×, aspect ratio (bars, stretched, or
-  filling the screen), screen layouts for the TV and GamePad pictures (GamePad inset, side by side,
-  TV only, GamePad with TV inset). All of them apply immediately, without a restart.
-- **Dual-screen devices** (AYN Thor and the like): the GamePad picture goes to the second screen by
-  itself, with touch, and the main screen shows the TV picture; Graphics › GamePad screen switches
-  back to the screen layouts.
-- **On-screen controls** for the whole GamePad, which hide while a controller is in use.
-- **Gyro aiming** with the device's motion sensors or a controller's (DualSense, DualShock 4, Switch
-  Pro and others that Android reports with sensors), also with "Wii U Pro Controller" selected,
-  where the original game has no gyro aiming.
-- **Rumble** on the controller in use, or on the device while playing by touch.
-- **The original project's gameplay mods** on Android: climb any wall, direct right-stick camera,
-  first person on R3, quick doors, fast scene changes.
-- **Faster running and swimming** (a new mod): Link runs and swims 1.25 up to 4 times as fast;
-  everything else keeps its speed.
-- **Right-to-left text** for Arabic and Hebrew fan translations: replacing the game's 2D language
-  pack shapes and orders the text itself, no code patch needed (`docs/rtl-text.md`).
-- **Performance work for weaker devices**: BC textures unpacked on the GPU where it can't sample
-  them (most Mali and PowerVR GPUs), precise Vulkan barriers (on a Mali-G52 the GPU time per frame
-  drops from 52 to 40 ms), much less work on the render thread (on a Snapdragon 855 from 24 to 16 ms
-  a frame), with the Qualcomm driver a second thread for the Vulkan commands, Android performance
-  hints and game modes, and SVE where the processor has it.
-- **Crash logs**: if the game crashes, the next start offers its log in Android's share menu, for a
-  bug report. It shows where the game crashed and with which app and game version, device and
-  settings; it contains no personal data. About › Share crash logs shares the logs kept; a shared
-  log is deleted at the next start.
-- **Fixes**: correct lighting on the first visit to a scene with an empty shader cache; game files
-  found on devices whose storage tells upper and lower case apart.
-- **No internet access**: the app doesn't request it, and its manifest explicitly excludes it.
+<p align="center"><sub>Screenshots taken on a Samsung Galaxy S20 FE 5G (Snapdragon 865), full screen at 2400 × 1080.</sub></p>
 
-## Version history
+---
 
-**0.6**
+## Contents
 
-- Cemu archives (`.wua`) as a game source: choose a folder with the `.wua` instead of a disc image
-  and keys.
-- Crash logs can be shared from the app: after a crash the next start offers the log in Android's
-  share menu (also under About). The log now also shows the app and game version, the device, the
-  settings and the place in the game. A shared log is deleted at the next start.
-- Updating from 0.5 keeps the prepared game code: no new compile.
+- [Download](#download)
+- [What's new in Plus](#whats-new-in-plus)
+- [Getting started](#getting-started)
+- [How to play](#how-to-play)
+- [Settings guide](#settings-guide)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Building from source](#building-from-source)
+- [Credits](#credits)
+- [Legal notice](#legal-notice)
 
-**0.5**
+---
 
-- The Japanese version of the game is now supported.
-- Widescreen: the game renders at the screen's shape (Graphics › Widescreen).
-- The sun's corona and lens flare, the haze in the distance and the bloom look as on the Wii U.
-- Faster rendering: much less CPU time on the render thread (from pull request #8 by SSunnKing);
-  with the Qualcomm driver the Vulkan commands are recorded on a second thread.
-- Graphics fixes: black lines in shadows, depth surfaces in copies and comparisons.
-- With a Turnip driver the GPU always renders in tiles (faster on an Adreno 740).
-- Without frame generation, 90 and 120 Hz screens are asked to run at 60 Hz (the game shows at most
-  60 frames a second).
-- A crash log for bug reports (`captures/` in the app's files folder).
-- The game code is prepared again once after the update (it is now built with more optimisation).
+## Download
 
-**0.4**
+Get the latest APK from the **[Releases page](../../releases/latest)**.
 
-- Controller buttons can be assigned to other Wii U buttons (Controls › Controller buttons).
-- A new mod: faster running and swimming, each 1.25× up to 4×, always or with L3 (press to switch
-  on and off, or hold).
-- Updating from 0.3 keeps the prepared game code: no new compile.
+**Requirements**
+- Android 11 or newer, 64-bit ARM (arm64-v8a)
+- A GPU with Vulkan 1.1 (Adreno, Mali, Xclipse, PowerVR)
+- About 2 GB of free storage (the extracted game) and 2 GB of free RAM for the one-time setup
+- Your own copy of The Wind Waker HD for Wii U: USA, Europe or Japan
 
-**0.3**
+---
 
-- The European version of the game is now supported. A Game tab to choose the game language was added in the overlay options menu.
-- Custom GPU drivers on Adreno GPUs (Turnip, newer Qualcomm drivers). Install them in the overlay options menu in the graphics settings.
-- Gyro aiming with the device or a controller motion sensors, also in Pro Controller mode which is useful for single screen devices.
-- Force feedback is working on the device in touchscreen mode or with a connected controller.
-- The WiiU GamePad picture on the second screen of dual-screen devices.
-- Save states keep the controller mode and switch back to it when loaded.
-- Performance overlay: average frame rate, the graphics settings in use, SoC, GPU and GPU driver,
-  with labelled values.
-- Faster on Mali and other GPUs without BC textures; less CPU time on the render thread; Android
-  performance hints, game modes and SVE.
-- Fixes:
-  - A crash at boot where the device's storage tells upper and lower case apart
-  - The Saves tab shows a new state as soon as it is written
-  - Removing a GPU driver removes its pipeline cache
+## What's new in Plus
 
-**0.2**: the first release (USA version).
+### 🆕 New in v1.14: Arabic translation direct support, lighter game thread, baton visible, no GamePad flashes
+
+- **Direct support for Hesham's Arabic translation (دعم مباشر لترجمة هشام)**:
+  - Supports the official Arabic fan translation by [Arabic Hesham](https://arabichesham.com/games/the-legend-of-zelda-the-wind-waker-hd#download) out of the box!
+  - Import the `.zip` archive directly from your phone (**Mods › ترجمة هشام (العربية) › استيراد ملفات الترجمة (.zip)**).
+  - Built-in Right-to-Left (RTL) engine: shaping for Arabic glyphs (isolated, initial, medial, final), lam-alef ligatures, bidi line reordering, right alignment, and line wrapping at spaces (see [docs/rtl-text.md](docs/rtl-text.md)).
+  - Includes Arabic title screen logo (`Title_00.szs`) redirection and optional Arabic app UI (`العربية`).
+- **Less CPU for the same game**: the game code is now recompiled with the Android port v0.9.5's improvements
+  ([GreenNaugahyde](https://github.com/GreenNaugahyde/ZeldaWWHDRecompAndroid)): a one-load check at every function
+  entry, indirect calls looked up inline, 64-bit addressing for the game's struct accesses, inline paired-single
+  loads and stores, and the hottest functions placed together (instruction cache). The GX2 register writes take a
+  fast path for shader constants. On a Galaxy S20 FE (Outset, Windfall, Dragon Roost; 60 fps generated, 1.5x):
+  the game thread went from 38% to 33% of a core and the whole game from 102% to 95%, with the same frame pacing -
+  a cooler phone and more room on slower ones. The first start compiles the game code again (about 5 minutes).
+- **The Wind Waker's songs** (#24): in the Hybrid layout (the default for touch play) the GamePad covered the whole
+  screen while Link held the baton, hiding him and the song's notes. Now the TV stays on screen with the GamePad as
+  an inset.
+- **No GamePad flash at doors and loads** (#28): in the Hybrid layout, every load or scene change of a game in progress
+  showed the GamePad for a moment. It now shows only in menus and before a file is loaded.
+- **Fast Forward 3x and 4x** really run that fast with 60 fps (generated) on (as the original project's #268): the
+  game no longer waits for the display while it's held.
+
+### 🆕 New in v1.13: the first start in half the time, save states from anywhere, Cemu content packs, PowerVR and Huawei fixes
+- **The game code is prepared in about half the time** at the first start (and after updates that
+  change it): on a Galaxy S20 FE **4.6 minutes instead of about 10**. The functions a play through
+  the game reaches (a tour of 25 places: every dungeon and boss room, the islands) are optimized as
+  before; the ~21,000 others, which a play never or hardly ever runs, are compiled quickly. The game
+  runs as fast as before (the game thread's time in Outset, Windfall, the Forbidden Woods and Dragon
+  Roost Cavern is the same). Phones with enough free memory also compile on 4 cores instead of 3.
+- **Content packs (Cemu mods)**: **Mods → Content packs** installs Cemu graphic packs that replace
+  the game's files (models such as the Linkle mod, textures, texts) from a folder, or reads them
+  from `WindWakerHD Plus/Mods`. Each can be turned on and off. Cemu's code patches can't apply to
+  the recompiled game.
+- **PowerVR (Pixel 10 Pro and others)**: broken, spiky geometry fixed — the vertex attributes these
+  GPUs read wrongly are converted on the CPU (from the original project, #207).
+- **Huawei Kirin (Maleoon)**: compressed textures are decoded on the CPU, and the GPU decoder was
+  rewritten without the constructs mobile shader compilers choke on (from the original project).
+- **60 fps (generated)**: the scene's depth is read texel by texel. The gathered reads it used froze
+  an Adreno 650 until the phone restarted in another port and can give stray lines on some drivers;
+  on Mali, frame generation uses 32-bit shaders (garbage and flicker on Mali-G52).
+- **Save states load from anywhere**: loading a state at the title or the file select used to say
+  "cannot load here" (the game's threads aren't where a played file has them). Now the app goes into
+  the game by itself and loads the state as soon as it can; a notice shows meanwhile.
+- **A save state that crashes a few seconds after loading**: that is an Auto slot written by v1.11,
+  whose autosave could leave parts of the game's memory out; it can't be repaired, and the crash log
+  now names the state loaded last. Autosaves and states of v1.12 and later load and play on.
+- **The Auto slot always has its picture**: a slot without one (an autosave of an older version)
+  gets it when it is loaded.
+- From the original project: a crash at boot on slow storage (0275D21C), quick doors leaving the
+  Forbidden Woods' spore rooms, the Pirate's Charm ringing again with frame interpolation, Link's
+  hand no longer flying in at 60/120 fps, ropes blended with what they hang from, Sploosh Kaboom's
+  markers, and the title's controller question answered by itself in GamePad mode.
+
+### 🆕 New in v1.12: no black strip in the item menu, Select opens the map, sturdier save states, an autosave you can see
+- **The item menu opens cleanly** with a widescreen picture: for about a second after opening it,
+  a black strip showed at the left and the first page had a left arrow. The menu is also drawn to
+  the (hidden) GamePad picture until it has opened on the TV, and a layout drawn to both was laid
+  out for the GamePad's 16:9 screen. While the GamePad picture isn't shown anywhere, what is
+  drawn there no longer counts.
+- **Select opens the map**: a short press of the controller's Select opens the menu straight on the
+  **MAP** tab, or goes to the MAP tab when the menu is already open. Holding Select (or Select +
+  Start) still opens the app's settings. Turn it off in **Controls → Select opens the map**.
+- **Save states that don't get corrupted**:
+  - Android moves memory the game doesn't touch for a while into compressed swap (zram). States
+    saved only the parts still in RAM, so the swapped parts were missing and came back as zeros
+    on load. Every part of the game's memory is now saved (and the scan runs on all cores, so
+    saving takes about 1 s).
+  - A damaged or cut-off state file is recognised ("file is corrupt") instead of crashing the
+    game, and a load that could only unpack part of the state says so.
+  - After a load:
+    - textures that were render targets are uploaded again, and the GamePad audio mix is
+      restored;
+    - moon jump, climbing and quick doors start from a clean state;
+    - the next autosave waits a whole interval, instead of writing over the slot just loaded.
+  - Leftover files of a save cut short (the app closed while writing, up to ~500 MB) are deleted
+    at start.
+- **An autosave you can see**: the **Auto** slot now has its picture, like the other slots (it
+  looked empty), and a short **"Autosaved"** notice shows when it is written.
+
+### 🆕 New in v1.11.1: Beedle's shop no longer closes the game, a steady 60 fps (generated), a round telescope
+- **Leaving Beedle's Shop Ship no longer closes the game** (and the game starts normally again): on
+  the way out the game sails you back to the sea room it noted on the way in, and halts if that room
+  is missing (its own check, `d_stage.cpp`). The room is now made sure of when you go in and when you
+  come out (from the ship's position on the sea when the game has none). Tested going in, talking
+  or not, walking out, going in again and out again.
+- **60 fps (generated) without trembling**: the in-between frame now decides, for every 4x4 pixels,
+  whether that part of the picture stays still in the world, follows the camera (Link, his boat, the
+  title's boat) or moves on its own, by checking each against the previous picture. Deciding it per
+  16x16 block split objects in two (the title's dragon came out torn and shaking). On the title
+  screen the depth of Outset was also lost (the game draws the boat over a cleared depth buffer):
+  it is now kept, so the cliffs and the bridge move exactly half-way in the in-between frame. The
+  same GPU time as before.
+- **The telescope's round view is round again** with a widescreen picture (it was stretched into an
+  ellipse with the rest of the first-person view's frame).
+- No more message about tapping the menus in Pro Controller mode.
+
+### 🆕 New in v1.11: 16% less GPU work, a cleaner 60 fps, saves that survive updates, a real autosave, clean screen edges
+- **60 fps (generated) redone: no torn objects in fast camera turns, no halos around the HUD.**
+  The in-between frame used to look, for each pixel, for the scene's pixel that lands there; where
+  something near stands in front of something far that search has two answers, and in a fast turn
+  thin parts (the King of Red Lions' fins, railings, leaves) came out torn into strips or doubled
+  at the screen's edge. The scene is now moved as a mesh (a point every 2-3 pixels, each moved by
+  the camera's and the object's own movement, with a depth test): what is near always covers what
+  is far, and what a near object uncovers is filled from what is behind it. The HUD is no longer
+  told apart by comparing pictures: every HUD draw also writes how much of the scene it covers, so
+  the scene moves behind translucent icons, frames and glows too, while the HUD itself stays still.
+  It costs ~1.9 ms of GPU per generated frame more than before (S20 FE at 1.5x: 23.9 ms per pair of
+  frames out of 33).
+- **The game no longer runs twice as fast at 120 Hz and above** with 60 fps (generated) on a phone
+  whose screen runs at 120 Hz (the game's step was paced at the screen's refresh instead of 30 Hz).
+- **Autosave without the freeze**: an autosave held the game for 0.4-1.6 s (writing ~235 MB with the
+  game stopped). The memory is now written ahead, while the game runs, and at the autosave only what
+  changed since (a few MB) is taken: the game stops for 0.1-0.3 s, at a moment where it isn't felt
+  (a menu, a dialogue, just after entering an area). The save threads also no longer crowd the one
+  core the game runs on, which made every save state faster.
+- **Protection against a crash that comes back at every start**: a shader or pipeline the GPU driver
+  crashes on is remembered and skipped the next time, so the game can't be stuck crashing on the
+  loading screen (reported after entering Beedle's shop from the boat; it wasn't reproduced here,
+  but whatever the driver crashed on is now left out at the next start). A crash log is still kept.
+- **A controller connected: touching the screen no longer brings the on-screen controls back.** With
+  **Controls act as: Wii U GamePad** the controller works as the GamePad and the game's menus can be
+  tapped as on the GamePad. In Pro Controller mode the game's menus don't take touches (as on the
+  console); a touch in a menu says where to change it.
+- **Saves that are never lost again** (**Saves → Saves outside the app**): allow Android's **"All files
+  access"** once and the app keeps a copy of your game save, **your save states** and your settings
+  in the **`WindWakerHD Plus`** folder of your phone, updated as they change. That folder stays when
+  the app is uninstalled, so an update signed with another key (which Android only installs after
+  uninstalling the old app) or a reinstall **brings everything back by itself** the first time the
+  game starts without a save. With the access the app also finds the automatic backups of earlier
+  versions in `Download/WindWakerHD Saves`.
+- **Autosave on by default, and when you leave the game**: a state in the **Auto** slot every 5
+  minutes of play (1, 2, 5 or 10 in **Saves → Autosave**), and another one as you lock the phone or
+  switch apps, where Android may close the game without a word. The game pauses once it is written.
+- **The controller select and file select screens no longer flicker at the edges**: their
+  background, drawn to the TV and the GamePad at once, was now and then stretched over the wider
+  picture for a frame (the screen each layout was last drawn to raced the render thread).
+- **No more dark band or glow along the screen edges**: the widened and half-size buffers were
+  created a fraction of a pixel larger than what was drawn into them, so their last column (or row)
+  kept an old picture or the clear colour, and the bloom, blur and ambient occlusion spread it into
+  a dark or bluish band along the right and bottom edges (seen at 1x and 1.5x on a 20:9 screen).
+  The 1-pixel bars beside a picture of almost the window's shape are gone too.
+- **The graphics rewritten for phone GPUs: −16% of GPU work per frame, the same picture.** On a
+  Galaxy S20 FE at 1x (Outset at night, the same frame each time) the GPU now works **20.5 ms a
+  frame instead of 24.4**, with nothing turned off: a frame rendered both ways is identical (2 of
+  1.15 million pixels differ by 1/255).
+  - **The console's multiply without its cost** (−3.5 ms): the Wii U's GPU gives 0 × anything = 0,
+    so every multiply in the translated shaders was a compare, a select and the multiply, ~16,000 of
+    them in the game's shaders. The translator now proves, for each multiply, that neither operand
+    can be infinite or NaN (a value only becomes one through a reciprocal, square root, log or
+    exponential, integer bits read as a float, or a memory read; register by register, following
+    the program's flow), and emits a plain multiply there. The reciprocals, roots, logs and
+    exponentials themselves are kept finite (±2⁶⁴ instead of ±infinity, so 0 times them is still 0
+    as on the console). Pixel shaders: 8,699 emulated multiplies → 226; vertex shaders 8,487 → 471.
+    The first start after updating prepares the shaders again (once).
+  - **No more scene passes broken in the middle** (−0.5 ms): a texture drawn earlier in the frame
+    and first read in the middle of the scene pass needed a layout change, which ended the pass:
+    the GPU stored the whole scene (colour, its second target and depth, ~15 MB) and loaded it back,
+    four times a frame. Each pass now remembers what it reads and gets it ready before it begins:
+    the scene is drawn in 2 passes instead of 5.
+  - Clears are done by the render pass that draws next instead of being written to memory and read
+    back (saves a full write and read of each cleared target on GPUs that render in tiles: Mali,
+    Turnip; Qualcomm's own driver already did this by itself).
+  - The game's blur reads one tap at 1x on a 20:9 screen again (the area-sampled taps meant for
+    higher resolutions were used for the widened buffers too).
+  - **Dynamic resolution follows the GPU load too**: while the GPU can't keep up, the 3D resolution
+    steps down (to 0.6x on weaker phones), and back up when there is room again.
+  - **Graphics: Light** (**Graphics → Graphics**), for weaker GPUs: no ambient occlusion and no
+    distant shadows (19.3 ms instead of 20.5 on the S20 FE). Adreno 5xx and the smaller 6xx, Mali
+    G31–G72 and PowerVR start with it.
+- **Defaults for a new install**: **30 fps** (the game's own rate and the lightest; 60 fps generated
+  is a choice in **Graphics → Frame rate**), Original resolution (720p), the phone's language for the
+  app and the game. **Game → Game language** lists **Português (Brasil)** (the built-in translation).
+- **Release builds refuse to be signed with a debug key** (v1.10 was, which is why it couldn't be
+  updated over v1.9 and v1.11 can't be installed over it).
+
+### 🆕 New in v1.10: smooth area changes, no black flashes, save states that don't close the game, a cool phone in your pocket
+- **Much smoother when going from one area to another**: entering an area translated hundreds of
+  shaders again for 2-4 frames (100-230 ms stutters), even in an area visited minutes before, and
+  each time the result was the same. The shader key took in register state the translation never
+  reads (an earlier shader's leftover vertex semantics, export IDs and pixel inputs, the blend and
+  write-mask bits of the colour targets). On a Galaxy S20 FE, eight area changes twice over:
+  15,737 → 4,962 shaders, **none** translated when coming back to an area (~1,500 before), worst
+  frame entering an area 226 → ~120 ms, coming back ≤ 77 ms. Less memory as well.
+- **No more black or flashing 3D picture**: a few pixels whose colour came out as NaN (the Wii U's
+  GPU gives 0 for 0 × infinity, this one doesn't) were spread by the bloom and blur over the whole
+  screen: the 3D picture went black for some frames while the HUD stayed (seen in a night storm at
+  sea, 10% of the frames). Every pixel colour is kept finite now. The first start after updating
+  compiles the shaders again (once).
+- **The game pauses when you lock the phone or switch apps**: before, it kept playing unseen
+  (enemies and timers going on), drawing for no window and mixing sound nobody heard, a whole CPU
+  core busy with the screen off. Now it waits where it is: **CPU in the background 100% → 4%**,
+  much less battery and heat, and it continues exactly where you left it, without glitches.
+- **Save states no longer close the game a few seconds after saving**: saving held the whole state
+  (~235 MB) in memory until it was written, and loading read the whole file into memory, so Android
+  closed the game for low memory on 6 GB phones (and a state could seem impossible to load). Now
+  the state is written as it is compressed and the file is read in place: ~45 MB extra instead of
+  ~235 MB. Saving holds the game for about a second.
+- **Hybrid layout: the GamePad comes up for the Wind Waker's songs** (#14), as it does for the
+  pause menu (thanks [jaimepa17](https://github.com/jaimepa17) for the detailed report).
+- **Rotation**: the app changes Android's rotation settings only where the system ignores the
+  game's landscape. A lock screen or another app that turns the screen no longer fights with the
+  game.
+
+### 🧊 New in v1.9: no more closing between areas, shaders ready before you play, a cooler phone
+- **No more "crashes" when going from one area to another**: the game's GPU memory grew with every
+  area visited (textures were never freed) until Android closed the game for low memory, without
+  a crash log. Textures the game no longer uses are freed now, and upload memory is given back:
+  on a Galaxy S20 FE, 44 areas in a row end at ~1.6 GB instead of being closed past 2.4 GB.
+- **Every shader prepared behind the loading screen** (**Graphics → Prepare all shaders at
+  start**, on by default): the pipelines your cache knows are built before the game starts instead
+  of a few per frame while you play, which caused stutters for the first minutes.
+- **A much lighter shader cache**: the same shader was kept as hundreds of thousands of variants.
+  The first start after updating compacts it once (on the test phone: 335 MB → 11 MB, loading
+  17-24 s → under a second, ~550 MB less memory), and an area you visited before no longer
+  translates hundreds of shaders as you enter it (100-450 ms hitches).
+- **Lower resolution when the phone gets hot** (**Graphics**, on by default): above 1x, the
+  resolution steps down while the phone is hot and returns when it cools (Windfall at 1.5x on a hot
+  S20 FE: GPU busy 81% → 56%). Less heat, less battery, no throttling.
+- **Save states survive updates and frame rate changes**: states saved by another version or
+  session failed with "host function ... is not registered at the same address". Older states
+  load now too.
+- **Autosave without the pause in the middle of the action**: it waits for a menu, a dialogue or
+  the moment after entering an area.
+- **Controllers**:
+  - **Select + Start** opens and closes the options menu.
+  - Sticks that don't reach the edge of their range (Retroid Pocket 6 pushed up) now make Link run
+    (#12).
+  - A controller that reports motion sensors but sends nothing: the phone's gyro is used.
+- **Android 11 and 12**: the app no longer closes at start (#11, Huawei MatePad).
+- From the original project: a shader translation reserves 1 MB instead of 12 MB, and an
+  allocation failure there no longer crashes.
+
+### 🌐 New in v1.8: autosave, Spanish menus, any translation
+- **Autosave** (**Options → Saves → Autosave**): an **Auto** save-state slot, above slot 1, written
+  every 1, 2, 5 or 10 minutes while you play a save file. Off by default. By
+  [jaimepa17](https://github.com/jaimepa17) (#7).
+- **The app in Spanish**: every menu, dialog and setup screen, following the phone's language or
+  chosen in **Game → App language**. By [jaimepa17](https://github.com/jaimepa17) (#6).
+- **HUD buttons and cheats after a heart piece**: the X/Y/R touch buttons and the cheats stopped
+  working once Link's maximum health wasn't a whole number of hearts. Fixed by
+  [jaimepa17](https://github.com/jaimepa17) (#8).
+- **Any fan translation of the game**: **Mods → Portuguese (Brazil) translation → Install another
+  translation (any language)…** takes a translation's folder (Korean, say). The built-in Portuguese
+  one no longer replaces it, and the button icon mod leaves the HUD's text alone when the
+  translation's font lacks the characters it uses.
+- **Recompiled game code built with wrapping integer arithmetic** (as the original project's #172):
+  a signed overflow in the game behaves as on the Wii U instead of being undefined. The game code is
+  prepared again once after updating (about 10 minutes).
+
+### 🔄 New in v1.7: up to date with both projects, Turnip without restarts, always landscape
+- **Up to date with the Enhanced fork (1.3–1.4) and the Android port (v0.9.3)**:
+  - **Frame rates**: 120 fps on 120 Hz screens; 60 fps is now paced (frames that don't fit are
+    left out and the game keeps its speed) and replaces the adaptive mode. 60 fps (generated) stays
+    the default.
+  - **Fewer GPU hangs with Qualcomm's older drivers** (v502 on Adreno 640/650, such as the Galaxy
+    S20 FE's own): pipelines are created one at a time there.
+  - **Save states with much less memory** (compressed while they are made) and **shaders using
+    far less memory** after long sessions.
+  - **Moon jump** cheat (hold L to fly), a loading screen while the shader cache loads, optional
+    **console-accurate blur**, a **command recording thread** setting, fuller crash logs.
+  - After a GPU hang, the next start **offers another GPU driver** (or the system's).
+- **Turnip (Mesa) drivers fixed on Adreno 6xx**: above 1x resolution, Turnip **restarted the whole
+  phone** at the first frame on a Galaxy S20 FE (a fatal bus error in the chip). The app now turns
+  off UBWC compression for Turnip on Adreno 6xx by itself: 1.5x and 2x run, and 1x is as fast.
+- **A driver that failed can be chosen again**: after a crash, choosing the same driver used to
+  send the next start straight back to the system driver without trying it. A driver that crashes
+  is now named when the game starts.
+- **Always landscape**: some ROMs ignore the game's orientation, and Samsung's game tools turn
+  auto-rotate on when a game starts, so the game could show in a portrait strip. The app asks once
+  for **"Modify system settings"** and then keeps the screen in landscape while you play (the side
+  you hold the phone), giving your rotation settings back when you leave.
+- **Button icons: Wii U, Xbox or PlayStation** (**Mods → Button icons**): the touch controls and
+  the game itself (the HUD's button guide and the icons in its text, "Press A") show the symbols of
+  the controller you play with, in the game's own font, following the buttons you assigned (a
+  remapped button shows its own symbol). The game's icons change after a restart.
+- **From the original project (ZeldaWWHDRecomp)**:
+  - Frame pacing: a frame that misses its vsync is shown as soon as it is ready instead of a whole
+    vsync later, and the 60 fps step follows the display's own refresh.
+  - Faster recompiled game code (float compares, paired-single loads and stores): the game thread
+    takes 7% less time per frame.
+  - Minigame timers (letter sorting, auctions, boat race) no longer run twice as fast at 60 fps, Link
+    no longer flickers in conversations, and sails and flags move smoothly at 60 fps.
+- **60 fps (generated) steadier**: Link and the title's boat no longer shake back and forth.
+- **Recommended Turnip for Adreno 650** (Galaxy S20 FE, Snapdragon 865): see
+  [Performance](#performance).
+
+### ⚡ New in v1.6: performance and safer saves
+- **60 fps (generated)**, the new default frame rate. The game runs at its own 30 fps and every
+  other frame is made on the GPU from the last one. It uses the scene's depth and the camera's
+  movement, plus a motion search for things that move by themselves, like Link and enemies. The
+  HUD is kept exactly as the game drew it. On a Galaxy S20 FE it holds **~60 fps while moving even
+  in the heaviest places** (Gohma's room, Forest Haven, Hyrule), where the 60 fps mode, which draws every
+  frame, drops to 53–55. The game's speed is unchanged: it never speeds up or slows down.
+- **Steadier 60 fps mode**: one frame of buffering in the game's vsync wait, so a single slow
+  frame no longer drops the game into a run of 30 fps frames (Outset Island, standing: 51 → 60 fps).
+- **Less GPU work per frame** (−8 to −14%, Gohma's room 24.4 → 22.4 ms):
+  - Half-size bloom.
+  - Post-processing buffers stay at native size when you raise the resolution.
+  - The hidden GamePad picture is no longer drawn.
+  - Fewer render passes.
+  - A new **Graphics → Distant shadows** option skips the far shadow cascade on weak GPUs.
+- **Fewer stutters from the CPU side**: game files are decompressed natively with a cache, and the
+  game's busy-wait loops yield the CPU.
+- **Saves you don't lose**:
+  - **Automatic backup** of your game save to `Download/WindWakerHD Saves` on your phone. It
+    survives uninstalling the app and is updated whenever the game saved; you can turn it off in
+    **Saves**.
+  - On a fresh install with no save, the app **offers to restore it** from there.
+  - Export and import still work for any folder (and for saves from Cemu).
+- **Item menu arrows fixed** in widescreen: the first page no longer shows a left arrow and the
+  last page no longer shows a right arrow.
+- **Permanent release key**: from v1.6 on, every update installs over the previous version and
+  keeps your saves and settings.
+
+### 🇧🇷 Brazilian Portuguese
+- **Built-in translation of the game** by [Triforce-Heroes](https://triforce-heroes.com.br) (v2025.08.05,
+  100%). The APK carries only the translated texts and the changed font glyphs, as a 470 KB patch.
+  On the first start the app builds the translated message pack from **your own** game files and
+  checks it against the original. Turn it on or off in **Mods → Portuguese (Brazil) translation**.
+  It is on by default when your phone is set to Portuguese.
+- **The whole app in Portuguese**: every menu, dialog and setup screen. It follows your phone's
+  language, or choose it in **Game → App language**.
+
+### 🎮 Controls
+- **Camera stick**: a fixed right analog stick for the camera. You can still swipe on the right
+  side of the screen.
+- **Skip button in cutscenes**: during story scenes the touch controls disappear and a single
+  **Skip ▶▶** button appears. It presses + twice, as the game asks, in both GamePad and Pro
+  Controller modes.
+- **External controllers**: Xbox, PlayStation (DualSense, DualShock 4), 8BitDo, Switch Pro and
+  generic gamepads. The right stick and the triggers are detected per controller, so generic
+  layouts no longer swap them. **The touch controls hide as soon as a controller connects.**
+- **Motion controls from the controller**: gyro aiming with the controller's own sensors
+  (DualSense, DualShock 4, Switch Pro, 8BitDo in Switch mode). If the controller has none (Xbox),
+  the phone's sensors are used. **Controls → Motion controls** shows which sensors are in use.
+
+### 🖥️ Display and HUD
+- **HUD layout editor** (**Graphics → HUD layout**): drag, resize and hide the hearts, rupees,
+  item buttons, small keys and wind compass over the running game. You can also hide the whole HUD
+  for a clean screen.
+- **Full screen beside the camera cutout**: the game fills the whole display (2400 × 1080 on a
+  Galaxy S20 FE, instead of 2312).
+- **Widescreen item menu fixed**: with *Screen shape*, the pause and item menu and every page of
+  it now render correctly.
+- **Menus that fit any phone**, with a *Menu size* setting.
+
+### 📦 Game setup
+- **`.wua` archives** (Cemu's compressed format) as a game source. They need no keys; an update or
+  DLC in the archive is skipped.
+
+### 🛡️ Stability
+- **GPU safe mode**: if the game closes because of the GPU driver, the next start turns on a safe
+  level by itself, tells you, and can be changed in **Graphics → GPU safe mode**.
+- **Fixed a GPU hang at the title screen** on Adreno 650 with Qualcomm's driver (Galaxy S20 /
+  Snapdragon 865).
+- **Fixed save states closing the app** on phones with 6 GB of RAM.
+- **Faster game thread**: the game's main thread runs on the prime core by default, and wake-ups
+  that nobody waits for are skipped.
+
+### And everything from Enhanced and the Android port
+Floating movement stick, context buttons that follow your items, one-touch combat moves, a touch
+layout editor, native widescreen, 60 fps by frame interpolation, fixed shadows, pinch-to-zoom
+camera, save states, cheats, gameplay mods (quick doors, fast scenes, climb any wall, faster
+running…), custom GPU drivers on Adreno, frame generation and more. See
+[docs/enhanced-readme.md](docs/enhanced-readme.md) and [docs/android-port-readme.md](docs/android-port-readme.md).
+
+<p align="center">
+  <img src="docs/screenshots/05-item-menu-widescreen.jpg" width="49%" alt="Item menu in widescreen">
+  <img src="docs/screenshots/06-hud-layout-editor.jpg" width="49%" alt="HUD layout editor">
+  <img src="docs/screenshots/07-settings-graphics.jpg" width="49%" alt="Graphics settings">
+  <img src="docs/screenshots/08-settings-mods.jpg" width="49%" alt="Mods settings">
+</p>
+
+---
 
 ## Getting started
 
-You need:
+### 1. Prepare your game files
+Put **one** of these in a folder on your phone (for example `Download/WindWakerHD`):
 
-- an Android 11 (or newer) device with a 64-bit ARM processor and Vulkan 1.1, about 2 GB of free
-  storage and, for the one-time compile, about 2 GB of free memory;
-- your own dump of The Wind Waker HD (USA, Europe or Japan): the disc image (`.wux` or `.wud`), its disc key (a
-  `.key` file with the image's name) and the Wii U common key (`common.key`); or a Cemu archive of
-  the game (`.wua`, already decrypted: no keys needed).
+| Option | Files |
+|---|---|
+| **A. Cemu archive** (easiest) | your `.wua` file, made in Cemu with *File → Convert to compressed Wii U archive*. No keys needed. |
+| **B. Disc image** | your `.wud` or `.wux` image, its disc key (same name as the image, ending in `.key`), and the console's `common.key` |
 
-None of these are included or provided here.
+### 2. Install and set up
+1. Install the APK from the [Releases page](../../releases/latest). Allow installing from your
+   browser or file manager if Android asks.
+2. Open the app and tap **Extract from your disc image or .wua…**, then select the folder.
+3. The app extracts the game (about 1.7 GB), then **prepares the game code for your phone**. This
+   happens **once** and takes about 5–15 minutes depending on the processor. You can leave the app
+   meanwhile; a notification shows the progress.
+4. The game starts. Have fun!
 
-1. Put the image and both keys in one folder on your device (or the `.wua` file alone).
-2. Install the APK and start it. Choose **Extract from your disc image or .wua…** and select that
-   folder.
-3. The app extracts the game files (a few seconds to minutes), then prepares the game code for
-   your device (once; how long depends on the processor: about 6 minutes on a Snapdragon 7+ Gen 3,
-   7.5 minutes on a Snapdragon 855, 16 minutes on a Helio G85). You can leave the app meanwhile and read a Wind Waker walkthrough guide. A notification shows the progress and keeps the process alive.
-4. The game starts. The first visit to each place may stutter briefly while its shaders compile as usual.
-   After that they are cached.
+> **Updating to v1.14?** v1.14 is signed with the key of **v1.12** (the v1.7 key's password is no longer
+> available). **v1.12 installs v1.14 directly.** From **v1.13** (or v1.7–v1.11.1): turn on **Saves → Saves outside
+> the app** (or **Saves → Export saves**), uninstall, install v1.14 and set the game up again; the saves come back by
+> themselves (or with **Saves → Import saves**). From v1.14 on this key stays.
+>
+> **Updating from v1.6 or older?** v1.6's signing key was lost, so v1.7 is signed with a new,
+> permanent key and Android won't install it over v1.6. **Once more:**
+> 1. In the old app, open **≡ → Saves → Export saves** and pick a folder (for example `Download`).
+>    The automatic backup in `Download/WindWakerHD Saves` (v1.6) is already a copy too.
+> 2. Uninstall the old app, then install v1.7.
+> 3. Set up the game again. When it starts without a save, the app offers to restore one: pick the
+>    folder you exported to (or **Saves → Import saves** at any time).
+>
+> v1.7–v1.9 install over each other directly. **v1.10 was signed with a different key**: export your
+> saves, uninstall it and install v1.11 the same way (steps 1–3). v1.11 installs directly over v1.7–v1.9.
+> From v1.11 on, with **Saves → Saves outside the app** allowed, a reinstall brings your save, save
+> states and settings back by itself.
+>
+> **Updating from v1.11 / v1.11.1 to v1.12?** v1.11's key was lost too, so v1.12 has a new key and
+> Android won't install it over v1.11.x. With **Saves → Saves outside the app** on (the
+> `WindWakerHD Plus` folder), uninstall v1.11.x and install v1.12: your save, save states and
+> settings come back by themselves. Without it, export your saves first (step 1 above). The game
+> files are deleted with the old app, so the game has to be extracted again.
+>
+> **Updating to v1.13?** v1.13 is signed again with the v1.7 key (v1.12's was lost), which stays from
+> now on (backed up outside this PC). **v1.7–v1.11.1 install v1.13 directly.** From **v1.12** (or
+> v1.10): turn on **Saves → Saves outside the app**, uninstall, install v1.13; the saves come back by
+> themselves (or export them first, step 1 above).
 
-## Controls
+---
 
-The **on-screen controls** cover the Wii U GamePad: both sticks, the D-pad, A/B/X/Y, L/R/ZL/ZR,
-−/+ and the stick clicks (L3/R3). The
-controls hide while a game controller is in use and come back on the next touch.
+## How to play
 
-**Game controllers** map by button position, as the game uses them: the bottom face button is the
-Wii U's B, the right one A, the left one Y and the top one X; Select is −, Start is +. Under
-Controls › **Controller buttons** you can assign each Wii U button to another controller button:
-choose the Wii U button, then press the controller button (analog triggers and a D-pad that reports
-as a hat count too). A controller button already in use swaps places, so no Wii U button is lost.
-Home / Guide and holding Select always open the menu, and the menu itself keeps using the buttons by
-position.
+### Touch controls
 
-**Keyboards**: WASD move, the arrow keys turn the camera, K or Space = A, J = B, L = X, I = Y, Q/E =
-L/R, Left Shift = ZL, C = ZR, Enter = +, Tab = −, H = HOME, 1–4 = D-pad, X/V = stick clicks.
+| Control | What it does |
+|---|---|
+| **Left side of the screen** | Floating movement stick: it appears where your thumb lands |
+| **Camera stick** (right) | Turns the camera; turn it on or off in **Controls → Camera stick** |
+| **Swipe on the right side** | Also turns the camera; **double tap** to center it behind Link |
+| **Pinch on the right side** | Zooms the camera in and out |
+| **A / B / X / Y / R / ZR / ZL** | The Wii U buttons; their icons follow your items and equipment |
+| **Orange combat buttons** | Jump attack, spin attack, vertical slash, dodge — one touch each |
+| **❚❚** | The game's pause / item menu |
+| **Skip ▶▶** | Appears during story scenes: skips them |
+| **≡** | The app's settings menu |
+| **✎** | Touch layout editor: move, resize and remove controls |
 
-## The options menu
+If **≡** and **✎** are hidden, tap the bottom center of the screen to show them.
 
-The game keeps running while the menu is open, and changes apply at once.
+### With a controller
+Connect any Bluetooth or USB gamepad. The touch controls disappear automatically; touch the
+screen to bring them back. **Hold Select** or **press Home** to open the settings menu. **A short
+press of Select** opens the game's menu on its **MAP** tab. Remap the buttons in **Controls →
+Controller buttons**.
 
-**How to open it**
+### Editing the HUD
+Open **≡ → Graphics → HUD layout**. Each part of the HUD gets a frame:
+- **Drag** a frame to move that part.
+- **Drag the corner handle** or **pinch** to resize it (25% to 300%).
+- **🗑** hides the selected part, **+** shows it again.
+- **Hide HUD** hides everything for a clean screen.
+- **↺** resets everything, **✓** or Back closes the editor.
 
-- touch: the ≡ button at the bottom of the screen, or Android's Back.
-- controller: **hold Select** (View, Share, −: whatever the controller calls it) for a moment, or
-  press **Home / Guide** (the logo button, where the controller passes it to apps). A short press
-  of Select is still the game's − button. The same buttons close the menu again.
+---
 
-**With a controller**: L / R switch tabs, the D-pad moves and changes values, and as in the game
-the **right** face button selects and the **bottom** one goes back. (On an Xbox-style controller
-that is B to select and A to go back; on a PlayStation controller Circle selects and Cross goes
-back.)
+## Settings guide
 
-**The tabs**
+Open the settings with **≡** (or hold Select / press Home on a controller).
 
-- **Saves**: five save state slots with Save and Load (a state can only be loaded during
-  gameplay, for example the save select screen or anywhere in the game, and only with the build that saved it).
-  A state also keeps whether the controls acted as GamePad or Pro Controller; loading it switches
-  back to that, since the game only listens to the controller it was saved with. Exporting and importing saves. An imported game
-  save restarts the game.  
-- **Game**: the game language (the languages of your copy; applies after a restart).
-- **Graphics**: rendering resolution, frame generation, widescreen, aspect ratio, the GamePad screen (with a
-  second display), screen layout, ambient
-  occlusion, full-size occlusion depth, 16× anisotropic filtering, the performance overlay, the GPU
-  driver (Adreno only), and deleting the shader cache (restarts the game as on its first start).
-- **Mods**: the gameplay mods, all off by default, and faster running and swimming (each 1.25× up
-  to 4×: Link covers more ground while running or swimming; jumps, rolls, climbing and the boat
-  stay as they are). Each applies always or with L3, set separately: one press switches it on and
-  the next off (a press switches the one for what Link is doing, swimming or not), or only while L3
-  is held.
-- **Controls**: on-screen controls on or off, their size, whether the controls act as a Wii U
-  GamePad or a Pro Controller, motion controls (gyro aiming), rumble, and which controller button
-  presses which Wii U button.
+| Tab | Highlights |
+|---|---|
+| **Saves** | 5 save-state slots with pictures and the **Auto** slot (every 5 minutes and when you leave the game); import and export of your game saves; **saves outside the app** (they survive reinstalls); **automatic save backup** |
+| **Game** | Game language, **App language**, Menu size |
+| **Graphics** | Frame rate (**30** / 60 generated / 60), **Graphics: Quality / Light**, CPU cores, rendering resolution, **dynamic resolution**, widescreen, screen layout, **HUD layout**, ambient occlusion, bloom, **distant shadows**, performance overlay, GPU driver, **GPU safe mode** |
+| **Mods** | **Portuguese translation**, cheats (with moon jump), **button icons (Wii U / Xbox / PlayStation)**, direct camera, first person on R3, climb any wall, quick doors, fast scene changes, fast-forward cutscenes and dialogue, faster running and swimming |
+| **Controls** | On-screen controls, **camera stick**, edit touch layout, camera speed, combat buttons, vibration, GamePad / Pro Controller mode, **motion controls**, rumble, controller buttons |
 
-About (with the licenses) and Quit are always on the left.
+### Recommended settings
+- **Frame rate:** 30 fps, the default and the lightest. 60 fps (generated) is smooth everywhere
+  and only needs the phone to run the game at 30, with some extra GPU work per frame. On a very
+  fast phone you can try 60 fps, which draws every frame.
+- **Weaker phone:** **Graphics → Graphics: Light**, and keep **Dynamic resolution** on.
+- **CPU cores:** Prime core (game) — the default.
+- **Rendering resolution:** Original (720p) on mid-range or older phones; 1.5× (1080p) on
+  recent flagship phones.
+- **Widescreen:** Screen shape, to use your whole display.
 
-## Frame generation (Lossless Scaling)
+---
 
-Frame generation adds frames between the game's 30 frames per second: ×2 = 60 fps, ×3 = 90 fps,
-×4 = 120 fps, on a screen with that refresh rate. It uses the frame generation network of
-[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/) (LSFG 3), which is
-not part of this app: it needs the usual **`Lossless.dll`** from a Lossless Scaling installation on
-Windows (in the program's folder in your Steam library).
+## Performance
 
-Lossless Scaling costs a few euros on Steam, and its developer has earned every one of them. **Buy
-it, don't pirate it like Gonzo** would. And never share the DLL with others.
+Measured on a **Galaxy S20 FE 5G** (Snapdragon 865 / Adreno 650) at 720p, walking and turning
+the camera. These are the frame rates actually shown on screen (SurfaceFlinger):
 
-1. Copy `Lossless.dll` to your device.
-2. In the menu, open Graphics › Frame generation › **Select Lossless.dll** and pick the file.
-3. The app checks it, copies it into its private storage and switches frame generation on.
+| Area | 60 fps (generated) | 60 fps | v1.5, 60 fps (adaptive) |
+|---|---|---|---|
+| Outset Island | 60.0–60.3 | 53–55 | 53–57 |
+| Gohma's room (Dragon Roost Cavern) | 60.4 | ~53 | 30 |
+| Forest Haven | 60.3 | ~53 | 30 |
+| Hyrule | 60.4 | — | — |
+| Windfall | 59.7 | — | 55–60 |
+| Tower of the Gods | 59.5 | — | — |
+| Dragon Roost Cavern | 58.7 | — | 30 |
+| Forbidden Woods | 55.3 (short hitches while areas load) | — | 30 |
 
-The app was developed and tested with a `Lossless.dll` of 7,521,280 bytes; its shaders' SHA-1
-fingerprint is `fc6092a72b94003fac3d68e9a7b54954422db757`. A different version with the same shader
-layout is accepted with a warning, since it may compute something else and show wrong frames; a
-version with a different layout is rejected with the reason. If frame generation can't start on a
-device, its page in the menu says why.
+GPU drivers (v1.7, 60 fps generated, a tour through Outset, Windfall, Dragon Roost Cavern,
+Gohma's room, Forest Haven, Forbidden Woods, Tower of the Gods, Hyrule and Forsaken Fortress):
 
-Options: multiplier, network (performance, or quality at about 40% more GPU time), flow scale
-(resolution of the motion estimate; lower is faster, 50% is the default) and UI detection (keeps
-menus and text from warping). Generated frames show the game about one frame later. On the tested Snapdragon
-7+ Gen 3 (2560×1600, performance network, 50% flow scale): about 7 ms of GPU time per game
-frame for ×2, 9 ms for ×3; ×4 needs a 25% flow scale.
+| Driver | Result |
+|---|---|
+| **Turnip v26.3.0-20261013-r2** ([The412Banner/Banners-Turnip](https://github.com/The412Banner/Banners-Turnip/releases), the plain `Turnip-v26.3.0-….zip`) | **60 fps in all nine places**, Gohma's room at 26 ms of GPU time per game frame |
+| Qualcomm v502 (the phone's own) | 60 fps in all nine places; the fastest GPU time (12–14 ms per frame in Outset, against 17–22 for Turnip), so the best choice for the 60 fps mode that draws every frame |
+| Turnip 26.0 R8 (K11MCH1), Stable Turnip v2 / Mainline v32 (whitebelyash) | ~40 fps in Gohma's room and Forest Haven, 60 elsewhere |
 
-`runtime/src/vk/lsfg.cpp` is an independent implementation that runs the DLL's shaders; how they
-connect was worked out from the DLL itself. It contains no code from other LSFG projects.
+**Which driver on an Adreno 650 (Galaxy S20 / S20 FE, Snapdragon 865)?** Keep the phone's own
+Qualcomm driver: it has the fastest GPU time with this game. Of the common packages, **Qualcomm
+v615.77** (K11MCH1, made for Adreno 6xx) is the one worth trying; among Turnip builds, Banners-Turnip
+26.3 or K11MCH1 25.3.0 R11. Avoid `adreno676.53` (Adreno 7xx only), plain Turnip 24.1 R18 (breaks
+rendering on 6xx) and Turnip 26.0 R8 (slow here). Try a new driver at Original (720p) first.
 
-## GPU drivers (Adreno)
+Turnip above 1x resolution is stable since v1.7, but too slow on the Adreno 650 (1.5x: about 20 fps
+in a heavy place): keep **Original (720p)** with Turnip on this GPU.
 
-On devices with an Adreno GPU the game can run on another Vulkan driver than the one the device came
-with, for example a Mesa Turnip build or a newer Qualcomm driver. The app loads it with
-[libadrenotools](https://github.com/bylaws/libadrenotools) and takes the
-usual driver packages: a `.zip` with a `meta.json` and the driver's `.so` file.
+Recent flagships (Snapdragon 8 Gen 2 and newer) hold 60 fps in most of the game. Phones get hot
+after a while and lower their clocks: playing while charging makes that worse.
 
-1. Copy the driver package to your device.
-2. In the menu, open Graphics › GPU driver › **Install driver package…** and pick the file.
-3. Choose **Use and restart**. The first start with a driver takes a little longer while it compiles
-   the game's pipelines; each driver keeps its own pipeline cache.
+---
 
-The page shows which driver is running. If the game doesn't start with a driver (it crashes, hangs or
-can't be loaded), the next start goes back to the system driver and says so. Drivers differ a lot in
-speed for this game: try a few, and compare with the performance overlay.
+## Troubleshooting
 
-On some older Snapdragon phones the system driver makes the GPU hang after a few seconds to minutes
-of play and the game closes (seen on a Snapdragon 855 / Adreno 640 with a Qualcomm driver from
-2021). A Turnip driver runs the game there without these crashes, so if the game keeps closing on
-such a device, install one.
+| Problem | What to do |
+|---|---|
+| The app closes at the title screen or while playing | It turns on **GPU safe mode** by itself on the next start. If it keeps closing, set **Graphics → GPU safe mode → Maximum**. |
+| A custom GPU driver crashes | The app goes back to the system driver on the next start and names the driver. Choosing it again gives it a new try. After a GPU hang it offers another driver before the game starts. |
+| The phone restarts with a Turnip driver | Update to v1.7: Turnip on Adreno 6xx above 1x resolution restarted the phone, the app now prevents it. |
+| The game shows in a portrait strip | Some ROMs turn on "fixed to user rotation", which makes Android ignore every app's orientation. With a computer: `adb shell wm fixed-to-user-rotation default` (some ROMs turn it on again at every boot). Or allow **"Modify system settings"** when the app asks (or in Android's settings for the app): it then keeps the screen in landscape while you play. |
+| "The game closed unexpectedly" | The app saves a crash log. Tap **Share crash log** and attach it to an [issue](../../issues). |
+| Stutter the first time you visit a place | Shaders are being compiled; it is smooth from then on. |
+| Small artifacts at the screen edges or around moving things in 60 fps (generated) | Those are the generated frames. Choose **60 fps** if your phone is fast enough, or **30 fps**. |
+| I lost my save after reinstalling | Open **≡ → Saves → Import saves** and pick `Download/WindWakerHD Saves`: the newest save there is used. |
+| The controller's gyro isn't used | Check **Controls → Motion controls**: it shows the sensors in use. Xbox controllers have no gyro, so the phone's sensors are used. |
+| Text is in English with the translation on | The translation replaces the English text: set **Game → Game language** to English and restart. |
 
-## Building
+---
+
+## Building from source
 
 You need the Android SDK (platform 36), NDK 27.2.12479018, JDK 17, CMake 3.20+, Ninja, git and
 Python 3.
 
-**The APK without game code** builds LLVM for Android once (about 20
-minutes on a 12-core PC, 2 GB in `build/llvm`), then the app:
-
 ```sh
-tools/android/build-llvm.sh          # -> build/llvm/install (LLVM 20.1.8: AArch64 code generation, ORC JIT)
+# once: LLVM for the on-device recompiler (about 20 minutes, 2.5 GB in build/llvm)
+ANDROID_NDK=$HOME/Android/Sdk/ndk/27.2.12479018 tools/android/build-llvm.sh
+
 cd android
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdVersionCode=3 -PwwhdVersionName=0.3
+./gradlew assembleRelease -PwwhdDeviceRecomp -PwwhdVersionCode=19 -PwwhdVersionName=1.12
 ```
 
-Sign it with your own release key.  
+The APK is in `android/app/build/outputs/apk/release/`. Sign APKs you share with your own key
+(`android/keystore.properties`, never committed).
 
-```sh
-keytool -genkeypair -keystore ~/.android/wwhd-release.jks -storetype PKCS12 -alias wwhd \
-        -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=Your name"
-cat > android/keystore.properties <<EOF
-storeFile=/home/you/.android/wwhd-release.jks
-storePassword=...
-keyAlias=wwhd
-keyPassword=...
-EOF
-```
+The Portuguese translation patch is in `android/app/src/main/assets/ptbr/`. To make it again from
+a newer translation: `tools/translation/make_pack_patch.py <original pack> <translated pack> <patch>`.
 
-`android/keystore.properties`, `*.jks` and `*.keystore` are in `.gitignore`; never commit them.
-Raise the version code with every APK you share. Release builds ignore the testing launch extras
-(`WWHD_*`, `gameDir`).
-
-## Legal notice
-
-This is an unofficial fan project. It is not affiliated with, endorsed or sponsored by Nintendo or
-by the developer of Lossless Scaling. "The Legend of Zelda", "The Wind Waker", "Wii U" and related
-names are trademarks of their respective owners and are used here only to describe what this
-software is compatible with.
-
-This repository and the APK contain **no game code, no game assets, no keys and
-no part of Lossless Scaling**. To use the app you need your own, legally obtained copy of the game,
-dumped from your own Wii U disc and console, and for frame generation your own copy of Lossless
-Scaling. Everything game-specific (the extracted files, the compiled game code, shader caches) is
-created on your device from your own legal dump and must not be redistributed. 
-
-## License
-
-The code of this project is licensed under the Mozilla Public License 2.0 (see `LICENSE`).
-Third-party code keeps its own license: Cemu (MPL-2.0), {fmt} (MIT), zstd (BSD-3-Clause), glslang (BSD-3-Clause and
-others), the Vulkan Memory Allocator (MIT), volk (MIT), libadrenotools (BSD-2-Clause), and in the
-APK without game code
-[LLVM](https://llvm.org) and the NDK's libc++ (Apache-2.0 with LLVM Exceptions). The app shows all
-of these licenses under About.
+---
 
 ## Credits
 
-This fork is built on [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp), which
-did the recompilation, the Wii U system libraries and the original Metal renderer for macOS. The GPU
-address library, shader decompiler and a few reference structures are vendored from
-[Cemu](https://github.com/cemu-project/Cemu) (MPL-2.0); `tools/wudextract.py` and parts of the OS
-layer are ported from or follow Cemu as noted in those files. Frame generation uses the shaders of
-[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/) from your own copy.
+- **[ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp)**: the recompilation,
+  the Wii U system libraries, the 60 fps modes and many fixes.
+- **[GreenNaugahyde/ZeldaWWHDRecompAndroid](https://github.com/GreenNaugahyde/ZeldaWWHDRecompAndroid)**:
+  the Android port (Vulkan renderer, on-device compilation, options menu).
+- **[SSunnKing/ZeldaWWHDRecompAndroid---ENHANCED](https://github.com/SSunnKing/ZeldaWWHDRecompAndroid---ENHANCED)**:
+  the Enhanced fork (touch controls, widescreen, performance) this project is based on.
+- **[jaimepa17](https://github.com/jaimepa17)**: autosave, the Spanish menus and the HUD buttons fix.
+- **[Triforce-Heroes](https://triforce-heroes.com.br)** (Ricardo, Luana and David): the Brazilian
+  Portuguese translation of the game.
+- **[Cemu](https://github.com/cemu-project/Cemu)**: the GPU address library and shader decompiler
+  (MPL-2.0), and the ZArchive (`.wua`) format.
+- **[zeldaret/tww](https://github.com/zeldaret/tww)**: the decompilation used for the save data
+  and actor layouts.
+- **[Zstandard](https://github.com/facebook/zstd)**, glslang, Vulkan Memory Allocator, volk,
+  libadrenotools and LLVM (see the app's *About* screen for all licenses).
 
-[SSunnKing](https://github.com/SSunnKing) contributed pull request #8: the widescreen mode, graphics
-fixes, most of the render thread speedups, the record thread, Turnip tile rendering and the crash
-handler.
+---
+
+## Legal notice
+
+This is an unofficial fan project. It is **not affiliated with, endorsed or sponsored by
+Nintendo**. "The Legend of Zelda", "The Wind Waker", "Wii U" and related names are trademarks of
+their respective owners and are used only to describe what this software is compatible with.
+
+This repository and the APK contain **no game code, no game assets and no keys**. You need your
+own, legally obtained copy of the game, dumped from your own Wii U disc and console. The game is
+read from your copy on your device and never leaves it. Anything game-specific created on your
+device must not be redistributed.
+
+The Portuguese translation is the work of the Triforce-Heroes team, who distribute it for free.
+The app carries only the translated texts and changed glyphs, as a patch applied to your own game
+files.
+
+## License
+
+[Mozilla Public License 2.0](LICENSE), as the projects it is based on. Third-party code keeps its
+own license.

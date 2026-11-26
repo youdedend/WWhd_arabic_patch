@@ -1,4 +1,5 @@
 #pragma once
+#include "vk/vertex_cpu_policy.h"
 
 namespace LatteDecompiler
 {
@@ -264,7 +265,15 @@ namespace LatteDecompiler
 					cemu_assert_debug(decompilerContext->output->resourceMappingVK.attributeMapping[i] >= 0);
 					cemu_assert_debug(decompilerContext->output->resourceMappingGL.attributeMapping[i] == decompilerContext->output->resourceMappingVK.attributeMapping[i]);
 
-					shaderSrc->addFmt("ATTR_LAYOUT({}) in uvec4 attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], i);
+					// WWHD (issue #21): float attributes decoded on the CPU arrive as vec4 (vk/vertex_cpu_policy.h)
+					bool cpuFloat = false;
+					if (g_latteCpuVertexClasses && decompilerContext->fetchShader)
+						for (auto& group : decompilerContext->fetchShader->bufferGroups)
+							for (sint32 j = 0; j < group.attribCount; ++j)
+								if (group.attrib[j].semanticId == i && group.attrib[j].nfa != 1 &&
+									gfx::cpu_vertex_selected(group.attrib[j], g_latteCpuVertexClasses))
+									cpuFloat = true;
+					shaderSrc->addFmt("ATTR_LAYOUT({}) in {} attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], cpuFloat ? "vec4" : "uvec4", i);
 				}
 			}
 		}
@@ -417,6 +426,17 @@ namespace LatteDecompiler
 		{
 			if (psInputTable->import[i].semanticId > LATTE_ANALYZER_IMPORT_INDEX_PARAM_MAX)
 				continue;
+			const auto* options = shaderContext->options;
+			if (options && options->linkPSInputsToVS && !options->vsOutputSemantics.test(psInputTable->import[i].semanticId))
+			{
+				// WWHD: no vertex shader output for this input (LatteDecompilerOptions::linkPSInputsToVS):
+				// the value the GPU gives such an input, SPI_PS_INPUT_CNTL DEFAULT_VAL (bits 8-9)
+				static const char* const defaults[4] = { "vec4(0.0, 0.0, 0.0, 0.0)", "vec4(0.0, 0.0, 0.0, 1.0)",
+					"vec4(1.0, 1.0, 1.0, 0.0)", "vec4(1.0, 1.0, 1.0, 1.0)" };
+				const uint32 defaultValue = (shaderContext->contextRegisters[mmSPI_PS_INPUT_CNTL_0 + i] >> 8) & 3;
+				src->addFmt("const vec4 passParameterSem{} = {};" _CRLF, psInputTable->import[i].semanticId, defaults[defaultValue]);
+				continue;
+			}
 			src->addFmt("layout(location = {}) ", i);
 			if (psInputTable->import[i].isFlat)
 				src->add("flat ");

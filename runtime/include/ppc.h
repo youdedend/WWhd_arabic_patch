@@ -32,6 +32,8 @@ typedef struct Cpu {
     uint32_t res_addr, res_val; /* lwarx/stwcx. reservation */
     uint32_t pc;               /* target for indirect dispatch */
     uint32_t core;             /* host-side: which emulated core this thread runs on */
+    uint32_t preempt;          /* host-side: this thread's copy of g_core_preempt (the device-recompiled
+                                  code's entry check: one load); in what was padding, sizeof unchanged */
     void* thread;              /* host-side: owning guest thread object */
 } Cpu;
 
@@ -56,6 +58,16 @@ void ppc_trace_enter(uint32_t addr);
 /* per-core scheduling: a higher-priority thread on this core is ready, yield at the next function entry */
 extern volatile int g_core_preempt[3];
 void ppc_preempt(Cpu* c);
+/* the same check in the device-recompiled code (recomp/ops.c ppcop_enter), which may also continue
+   elsewhere than at the start: 0 from the start, 1 return at once, else the return address of a call
+   in the function to continue at (save states: a thread's call chain rebuilt, threads.cpp) */
+/* preserve_most: the rare slow path saves what it uses, so a function's fast path needs no stack
+   frame for it (small functions are called very often) */
+__attribute__((preserve_most)) uint32_t ppc_entry(Cpu* c, uint32_t fn, uint32_t size);
+/* the game code's functions by address, (addr - 0x02000000) / 4 over 16 MiB (dispatch, core.cpp):
+   indirect calls in the device-recompiled code look up here before falling back to ppc_dispatch */
+extern PpcFunc* g_ppc_text_table;
+__attribute__((noreturn)) void ppc_resume_failed(Cpu* c);  /* that return address isn't a call of the function */
 #define PPC_ENTER(a) do {                                                     \
         if (__builtin_expect(g_ppc_trace, 0)) ppc_trace_enter(a);             \
         if (__builtin_expect(g_core_preempt[c->core], 0)) ppc_preempt(c);     \
@@ -78,9 +90,44 @@ static inline uint64_t f64_as_u64(double d) { uint64_t u; memcpy(&u, &d, 8); ret
 static inline float u32_as_f32(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static inline uint32_t f32_as_u32(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
-static inline double ldf32(uint32_t ea) { return (double)u32_as_f32(ld32(ea)); }
+/* Big-endian floats through the FP/SIMD registers on AArch64 (ldr s + rev32, rev32 + str s): no move
+   between a general and an FP register (ldr w, rev, fmov s), and a pair (psq_l/psq_st) as one 8-byte
+   access, swapped and converted in both lanes at once. Same bits as the scalar forms. */
+#if defined(__aarch64__) && defined(__clang__)
+typedef uint8_t ppc_v8u8 __attribute__((vector_size(8)));
+typedef uint32_t ppc_v2u32 __attribute__((vector_size(8)));
+typedef float ppc_v2f32 __attribute__((vector_size(8)));
+typedef double ppc_v2f64 __attribute__((vector_size(16)));
+#define PPC_REV32(v) __builtin_shufflevector((ppc_v8u8)(v), (ppc_v8u8)(v), 3, 2, 1, 0, 7, 6, 5, 4)
+static inline float ldbe_f32(const uint8_t* p) {
+    uint32_t x; memcpy(&x, p, 4);
+    ppc_v2u32 v = {x, 0};
+    return ((ppc_v2f32)PPC_REV32(v))[0];
+}
+static inline void stbe_f32(uint8_t* p, float f) {
+    ppc_v2f32 v = {f, 0};
+    uint32_t x = ((ppc_v2u32)PPC_REV32(v))[0];
+    memcpy(p, &x, 4);
+}
+static inline void ldbe_f32x2(const uint8_t* p, double* a, double* b) {
+    ppc_v8u8 v; memcpy(&v, p, 8);
+    ppc_v2f64 d = __builtin_convertvector((ppc_v2f32)PPC_REV32(v), ppc_v2f64);
+    *a = d[0]; *b = d[1];
+}
+static inline void stbe_f32x2(uint8_t* p, double a, double b) {
+    ppc_v2f64 d = {a, b};
+    ppc_v8u8 v = PPC_REV32(__builtin_convertvector(d, ppc_v2f32));
+    memcpy(p, &v, 8);
+}
+#else
+static inline float ldbe_f32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return u32_as_f32(__builtin_bswap32(v)); }
+static inline void stbe_f32(uint8_t* p, float f) { uint32_t v = __builtin_bswap32(f32_as_u32(f)); memcpy(p, &v, 4); }
+static inline void ldbe_f32x2(const uint8_t* p, double* a, double* b) { *a = ldbe_f32(p); *b = ldbe_f32(p + 4); }
+static inline void stbe_f32x2(uint8_t* p, double a, double b) { stbe_f32(p, (float)a); stbe_f32(p + 4, (float)b); }
+#endif
+static inline double ldf32(uint32_t ea) { return (double)ldbe_f32(ppc_ptr(ea)); }
 static inline double ldf64(uint32_t ea) { return u64_as_f64(ld64(ea)); }
-static inline void stf32(uint32_t ea, double d) { st32(ea, f32_as_u32((float)d)); }
+static inline void stf32(uint32_t ea, double d) { stbe_f32(ppc_ptr(ea), (float)d); }
 static inline void stf64(uint32_t ea, double d) { st64(ea, f64_as_u64(d)); }
 
 /* ---- integer helpers ---- */
@@ -100,10 +147,15 @@ static inline uint32_t ppc_divw(uint32_t a, uint32_t b) {
 }
 static inline uint32_t ppc_divwu(uint32_t a, uint32_t b) { return b ? a / b : 0; }
 
-static inline uint32_t ppc_mfcr(const Cpu* c) {
-    uint32_t v = 0;
-    for (int i = 0; i < 32; i++) v |= (uint32_t)(c->cr[i] & 1) << (31 - i);
-    return v;
+/* eight CR bytes (0/1, little-endian host) to eight bits, the first byte in the top bit
+ * (ZeldaWWHDRecomp: mfcr with four multiplies instead of a 32-step loop) */
+static inline uint32_t ppc_cr_pack8(const uint8_t* p) {
+    uint64_t x;
+    memcpy(&x, p, 8);
+    return (uint32_t)(((x & 0x0101010101010101ull) * 0x8040201008040201ull) >> 56);
+}
+static inline __attribute__((always_inline)) uint32_t ppc_mfcr(const Cpu* c) {
+    return ppc_cr_pack8(c->cr) << 24 | ppc_cr_pack8(c->cr + 8) << 16 | ppc_cr_pack8(c->cr + 16) << 8 | ppc_cr_pack8(c->cr + 24);
 }
 static inline void ppc_mtcrf(Cpu* c, uint32_t crm, uint32_t v) {
     for (int f = 0; f < 8; f++)
@@ -144,11 +196,13 @@ static inline double round25(double d) {
 }
 static inline double to_single(double d) { return (double)(float)d; }
 
+/* fcmpu / fcmpo (ZeldaWWHDRecomp). IEEE comparisons with a NaN are false, so lt/gt/eq need no NaN
+ * test; un is the fourth outcome. FPSCR's FPCC field (which fcmp also sets) is not kept: only mffs
+ * and mcrfs read it, and this game has neither. The two hottest game functions are float compares
+ * in bounding-box tests. */
 static inline void cr_set_f(Cpu* c, int f, double a, double b) {
-    int un = isnan(a) || isnan(b);
-    c->cr[4 * f + 0] = !un && a < b; c->cr[4 * f + 1] = !un && a > b;
-    c->cr[4 * f + 2] = !un && a == b; c->cr[4 * f + 3] = (uint8_t)un;
-    c->fpscr = (c->fpscr & ~0xF000u) | ((uint32_t)(c->cr[4 * f] << 3 | c->cr[4 * f + 1] << 2 | c->cr[4 * f + 2] << 1 | un) << 12);
+    c->cr[4 * f + 0] = a < b; c->cr[4 * f + 1] = a > b;
+    c->cr[4 * f + 2] = a == b; c->cr[4 * f + 3] = (uint8_t)__builtin_isunordered(a, b);
 }
 
 static inline uint64_t ppc_fctiwz(double d) {
@@ -195,7 +249,10 @@ static inline uint32_t psq_quant(float v, uint32_t type, uint32_t scale) {
     default: return f32_as_u32(v);
     }
 }
-static inline void psq_load(Cpu* c, int fd, uint32_t ea, int w, int i) {
+/* paired-single loads and stores (ZeldaWWHDRecomp): plain floats (GQR type 0-3) are nearly all of
+ * them (2,082 of the game's 2,106 use GQR0 or GQR1, which stay 0): an inline fast path; the quantized
+ * formats out of line, so the float case stays small */
+static __attribute__((noinline)) void psq_load_slow(Cpu* c, int fd, uint32_t ea, int w, int i) {
     uint32_t g = c->gqr[i], type = (g >> 16) & 7, scale = (g >> 24) & 0x3F;
     int sz = (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4;
     uint32_t d0 = sz == 1 ? ld8(ea) : sz == 2 ? ld16(ea) : ld32(ea);
@@ -206,7 +263,7 @@ static inline void psq_load(Cpu* c, int fd, uint32_t ea, int w, int i) {
         c->f[fd].ps1 = psq_dequant(d1, type, scale);
     }
 }
-static inline void psq_store(Cpu* c, int fs, uint32_t ea, int w, int i) {
+static __attribute__((noinline)) void psq_store_slow(Cpu* c, int fs, uint32_t ea, int w, int i) {
     uint32_t g = c->gqr[i], type = g & 7, scale = (g >> 8) & 0x3F;
     int sz = (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4;
     uint32_t d0 = psq_quant((float)c->f[fs].ps0, type, scale);
@@ -215,6 +272,22 @@ static inline void psq_store(Cpu* c, int fs, uint32_t ea, int w, int i) {
         uint32_t d1 = psq_quant((float)c->f[fs].ps1, type, scale);
         if (sz == 1) st8(ea + 1, d1); else if (sz == 2) st16(ea + 2, d1); else st32(ea + 4, d1);
     }
+}
+static inline __attribute__((always_inline)) void psq_load(Cpu* c, int fd, uint32_t ea, int w, int i) {
+    if (__builtin_expect(((c->gqr[i] >> 16) & 7) < 4, 1)) {
+        c->f[fd].ps0 = u32_as_f32(ld32(ea));
+        c->f[fd].ps1 = w ? 1.0 : (double)u32_as_f32(ld32(ea + 4));
+        return;
+    }
+    psq_load_slow(c, fd, ea, w, i);
+}
+static inline __attribute__((always_inline)) void psq_store(Cpu* c, int fs, uint32_t ea, int w, int i) {
+    if (__builtin_expect((c->gqr[i] & 7) < 4, 1)) {
+        st32(ea, f32_as_u32((float)c->f[fs].ps0));
+        if (!w) st32(ea + 4, f32_as_u32((float)c->f[fs].ps1));
+        return;
+    }
+    psq_store_slow(c, fs, ea, w, i);
 }
 
 #ifdef __cplusplus

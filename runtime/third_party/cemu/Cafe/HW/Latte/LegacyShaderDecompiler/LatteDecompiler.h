@@ -2,6 +2,7 @@
 #include "Cafe/HW/Latte/Core/LatteConst.h"
 #include "Cafe/HW/Latte/Renderer/RendererShader.h"
 #include <boost/container/static_vector.hpp>
+#include <bitset>
 
 namespace LatteDecompiler
 {
@@ -256,16 +257,26 @@ struct LatteDecompilerOutputUniformOffsets
 
 struct LatteDecompilerOptions
 {
-	uint32 areaSampledTextures{0}; // WWHD: pixel-shader units the host reads area-sampled (gfx/area_sample.h); declares their uf_texNScale
+    uint32 areaSampledTextures{0}; // WWHD: pixel-shader units the host reads area-sampled (vk/area_sample.h); declares their uf_texNScale
 	bool usesGeometryShader{ false };
 	// floating point math
 	bool strictMul{}; // if true, 0*anything=0 rule is emulated
+	// WWHD: pixel colour outputs never carry NaN (written as 0) or infinity (+-65000). A
+	// constant operand is multiplied the IEEE way even with strictMul, so 0 * inf gives NaN where
+	// the console gives 0 (the thunderstorm's flash light: a black 3D picture for a few frames, as
+	// the bloom and blur passes spread a few NaN pixels over the whole screen)
+	bool finiteColorOutputs{ false };
 	// Vulkan-specific
 	bool useTFViaSSBO{ false };
 	struct
 	{
 		bool hasRoundingModeRTEFloat32{ false };
 	}spirvInstrinsics;
+	// WWHD: the pixel shader is translated for the draw's vertex shader. Its inputs with no matching
+	// vertex shader output become constants (the GPU's default value for them) instead of inputs:
+	// an input that no output writes made the Adreno driver refuse the pipeline (VK_ERROR_UNKNOWN).
+	bool linkPSInputsToVS{ false };
+	std::bitset<256> vsOutputSemantics; // semantic IDs the vertex shader exports
 };
 
 struct LatteDecompilerOutput_t

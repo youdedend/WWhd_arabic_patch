@@ -5,10 +5,8 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
+#include <ctime>
 #include <mutex>
-
-#include "runtime.h"
 
 namespace motion {
 namespace {
@@ -41,16 +39,17 @@ struct State {
     long biasCount = 0;
     // latest sample, in the fusion's axes
     float gyro[3] = {}, acc[3] = {}, prevAcc[3] = {};
-    std::chrono::steady_clock::time_point last{};
-    std::chrono::steady_clock::time_point lastLog{};
+    int64_t lastMs = 0;  // coarse monotonic clock (the game reads the pad thousands of times a second)
     bool valid = false;
 };
+// CLOCK_MONOTONIC_COARSE: a few ns per read (no counter read), enough for the 500 ms staleness check
+int64_t coarse_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 State g;
 std::mutex g_mu;
-// gyro diagnostics (not the fusion state: they survive reset())
-bool g_aiming = false;
-bool g_stickOut = false, g_stickLogged = false;
-std::chrono::steady_clock::time_point g_stickSince{};
 
 void update_bias(float gx, float gy, float gz) {
     if (std::fabs(gx) >= 0.35f || std::fabs(gy) >= 0.35f || std::fabs(gz) >= 0.35f) return;  // moving
@@ -114,9 +113,6 @@ float rev(float rad) { return rad / (2.0f * kPi); }
 }  // namespace
 
 void sample(float dt, float gx, float gy, float gz, float ax, float ay, float az) {
-    for (float v : {gx, gy, gz, ax, ay, az})
-        if (!std::isfinite(v)) return;  // a glitching sensor must not poison the fusion
-    static const bool gyroLog = getenv("WWHD_GYRO_LOG") != nullptr;
     std::lock_guard<std::mutex> lk(g_mu);
     // into the fusion's axes as Cemu's SDL provider passes them (acceleration in g)
     float acc[3] = {-ax / 9.81f, ay / 9.81f, az / 9.81f};
@@ -127,35 +123,8 @@ void sample(float dt, float gx, float gy, float gz, float ax, float ay, float az
         g.gyro[i] = gyro[i];
     }
     fuse(dt, gyro[0], gyro[1], gyro[2], acc[0], acc[1], acc[2]);
-    auto now = std::chrono::steady_clock::now();
-    g.last = now;
+    g.lastMs = coarse_ms();
     g.valid = true;
-    if (gyroLog && now - g.lastLog > std::chrono::milliseconds(500)) {
-        g.lastLog = now;
-        LOG("[gyro] sample dt=%.4f gyro=%.3f,%.3f,%.3f acc=%.2f,%.2f,%.2f bias=%.4f,%.4f,%.4f", dt, gx, gy, gz,
-            ax, ay, az, g.bias[0], g.bias[1], g.bias[2]);
-    }
-}
-
-void set_aiming(bool aiming) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_aiming = aiming;
-}
-
-void right_stick(float x, float y) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    const auto now = std::chrono::steady_clock::now();
-    const bool out = std::sqrt(x * x + y * y) > 0.1f;  // the game's dead zone (CalcSubjectAngle)
-    if (out && !g_stickOut) g_stickSince = now;
-    if (!out) g_stickLogged = false;
-    g_stickOut = out;
-    const bool flowing = g.valid && now - g.last < std::chrono::milliseconds(500);
-    if (out && g_aiming && flowing && !g_stickLogged && now - g_stickSince > std::chrono::seconds(2)) {
-        g_stickLogged = true;
-        LOG("[gyro] the right stick has rested at %.2f, %.2f for 2 s while aiming: the game ignores the gyro until "
-            "it is back within 0.1 of the centre (stick drift?)",
-            x, y);
-    }
 }
 
 void reset() {
@@ -165,7 +134,7 @@ void reset() {
 
 bool vpad(Vpad& o) {
     std::lock_guard<std::mutex> lk(g_mu);
-    if (!g.valid || std::chrono::steady_clock::now() - g.last > std::chrono::milliseconds(500)) return false;
+    if (!g.valid || coarse_ms() - g.lastMs > 500) return false;
     o.acc[0] = -g.acc[0];
     o.acc[1] = -g.acc[1];
     o.acc[2] = g.acc[2];

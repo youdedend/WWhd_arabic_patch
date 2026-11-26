@@ -1,6 +1,8 @@
 // Android input: the Java side merges the on-screen controls, game controllers and a hardware
 // keyboard into one Wii U GamePad state (MainActivity / InputMapper) and hands it over here.
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <mutex>
 #include <vector>
 
@@ -65,16 +67,48 @@ static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
 bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
 void set_pro_controller(bool on) { g_pro = on; LOG("[input] controls act as %s", on ? "Pro Controller" : "GamePad"); }
 
-PadState read() {
+static std::atomic<uint32_t> g_auto_buttons{0};
+void set_auto_buttons(uint32_t bits) { g_auto_buttons.store(bits, std::memory_order_relaxed); }
+
+PadState read(bool consume) {
     static const std::vector<Press> script = scripted();
     std::unique_lock<std::mutex> lk(g_mu);
     PadState s = g_pad;
-    s.buttons |= g_latched;
-    g_latched = 0;
+    s.buttons |= g_latched | g_auto_buttons.load(std::memory_order_relaxed);
+    if (consume) g_latched = 0;
     if (!script.empty()) {
         uint64_t frame = gfx::current_frame();
         for (auto& p : script)
             if (frame >= p.from && frame <= p.to) s.buttons |= p.bits;
+    }
+    // test aid: WWHD_TEST_MOVE=s walks Link around in a 16 s loop with the camera turning, from s
+    // seconds after the start (stutter measurements in motion)
+    static const double moveAt = getenv("WWHD_TEST_MOVE") ? atof(getenv("WWHD_TEST_MOVE")) : -1;
+    if (moveAt >= 0) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - moveAt;
+        if (t >= 0) {
+            const double ph = std::fmod(t, 16.0);
+            if (ph < 4) { s.ly = 1.0f; s.rx = 0.6f; }
+            else if (ph < 8) { s.lx = -1.0f; s.rx = -0.6f; }
+            else if (ph < 12) { s.ly = -1.0f; s.ry = 0.3f; }
+            else { s.lx = 1.0f; s.rx = 1.0f; }
+        }
+    }
+    // test aid: WWHD_TEST_TURN=s,speed walks Link forward with the camera turning at `speed` (right
+    // stick, -1..1) from s seconds after the start (60 fps generated: fast camera turns)
+    static const double turnAt = getenv("WWHD_TEST_TURN") ? atof(getenv("WWHD_TEST_TURN")) : -1;
+    static const float turnSpeed = [] {
+        const char* e = getenv("WWHD_TEST_TURN");
+        const char* c = e ? strchr(e, ',') : nullptr;
+        return c ? (float)atof(c + 1) : 1.0f;
+    }();
+    if (turnAt >= 0) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= turnAt) {
+            s.ly = 0.6f;
+            s.rx = turnSpeed;
+        }
     }
     s.touch = g_touch || g_touch_latched;
     g_touch_latched = false;
@@ -112,3 +146,4 @@ namespace mods {
 bool mouse_captured() { return false; }
 void mouse_release() {}
 }  // namespace mods
+

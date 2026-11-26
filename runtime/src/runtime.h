@@ -57,6 +57,7 @@ namespace dispatch {
 void init();
 // register a host function callable from guest code; returns its guest address
 uint32_t register_host(PpcFunc fn, const char* name);
+bool alias_host(uint32_t addr, const std::string& name);  // a save state's address for a host function
 void set(uint32_t addr, PpcFunc fn);
 PpcFunc lookup(uint32_t addr);
 }  // namespace dispatch
@@ -75,6 +76,7 @@ bool ensure_core();   // service threads entering guest code; true if the core w
 void release_core();
 void set_service_core(uint32_t core);
 void report_sched();  // log per-thread core usage
+uint64_t blocked_ns();  // time the calling thread spent in blocking scopes (including the wait for its core)
 }  // namespace threads
 struct BlockingScope {
     BlockingScope() { threads::block_begin(); }
@@ -94,7 +96,8 @@ Cpu* make_service_cpu(const char* name, uint32_t stack_size = 0x10000);
 void service_begin();
 void service_end();
 // a blocking sleep that counts as parked for save states (OSSleepTicks, GX2WaitForVsync)
-void park_sleep_until(std::chrono::steady_clock::time_point t);
+// precise: the last part (0.5..2 ms, following measured timer lateness) is spun, for vsync waits
+void park_sleep_until(std::chrono::steady_clock::time_point t, bool precise = false);
 
 // ---- save states (savestate.cpp) ----
 // Freeze every other guest thread at a parked point; the caller (the game's main thread, between
@@ -149,6 +152,7 @@ void log_msg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // ---- configuration ----
 namespace config {
 extern std::string game_dir;   // extracted game root (contains code/, content/, meta/)
+extern std::string content_overlay;  // mod folders whose content/ files replace the game's, one per line, the first winning ("" = none)
 extern std::string save_dir;   // host directory for save data
 extern std::string cache_dir;  // host directory for shader caches ("" = platform default)
 extern std::string code_dir;   // game code compiled on the device (WWHD_DEVICE_RECOMP builds)

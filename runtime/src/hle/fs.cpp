@@ -34,22 +34,38 @@ std::string dir() {
 std::string pack() {
     std::string d = dir();
     DIR* dp = opendir(d.c_str());
-    if (!dp) return "";
-    std::string found;
-    while (dirent* e = readdir(dp)) {
-        std::string n = e->d_name;
-        if (n.size() > 18 && !n.compare(0, 13, "permanent_2d_") && !n.compare(n.size() - 5, 5, ".pack")) {
-            found = d + "/" + n;
-            break;
+    if (dp) {
+        while (dirent* e = readdir(dp)) {
+            std::string n = e->d_name;
+            if (n.size() > 18 && !n.compare(0, 13, "permanent_2d_") && !n.compare(n.size() - 5, 5, ".pack")) {
+                closedir(dp);
+                return d + "/" + n;
+            }
         }
+        closedir(dp);
     }
-    closedir(dp);
-    return found;
+    // Also check content/Common/Pack subfolder if extracted as a pack structure
+    std::string sub = d + "/content/Common/Pack";
+    dp = opendir(sub.c_str());
+    if (dp) {
+        while (dirent* e = readdir(dp)) {
+            std::string n = e->d_name;
+            if (n.size() > 18 && !n.compare(0, 13, "permanent_2d_") && !n.compare(n.size() - 5, 5, ".pack")) {
+                closedir(dp);
+                return sub + "/" + n;
+            }
+        }
+        closedir(dp);
+    }
+    return "";
 }
 
 int ready() {
     struct stat st;
-    return (pack().empty() ? 0 : 1) | (stat((dir() + "/Title_00.szs").c_str(), &st) == 0 ? 2 : 0);
+    bool has_pack = !pack().empty();
+    bool has_title = (stat((dir() + "/Title_00.szs").c_str(), &st) == 0) ||
+                     (stat((dir() + "/content/Common/Package/Title_00.szs").c_str(), &st) == 0);
+    return (has_pack ? 1 : 0) | (has_title ? 2 : 0);
 }
 
 void set_enabled(bool on) { g_enabled = on; }
@@ -68,6 +84,8 @@ std::string redirect(const std::string& guest) {
         std::string t = dir() + "/Title_00.szs";
         struct stat st;
         if (stat(t.c_str(), &st) == 0) return t;
+        std::string t2 = dir() + "/content/Common/Package/Title_00.szs";
+        if (stat(t2.c_str(), &st) == 0) return t2;
     }
     return "";
 }
@@ -143,6 +161,29 @@ std::string case_insensitive(const std::string& root, const std::string& path) {
 std::string host_path(const std::string& guest) {
     std::string r = host_path_exact(guest);
     const std::string& g = config::game_dir;
+    // a mod's replacement for a game data file (content packs, the translation's message packs):
+    // <overlay>/content/... instead of <game>/content/..., from the first overlay that has the file
+    // (config::content_overlay: their folders, one per line)
+    const std::string gc = g + "/content/";
+    if (!config::content_overlay.empty() && r.compare(0, gc.size(), gc) == 0) {
+        // (set before the game starts)
+        static const std::vector<std::string> overlays = [] {
+            std::vector<std::string> v;
+            const std::string& all = config::content_overlay;
+            for (size_t a = 0; a < all.size();) {
+                size_t b = all.find('\n', a);
+                if (b == std::string::npos) b = all.size();
+                if (b > a) v.push_back(all.substr(a, b - a));
+                a = b + 1;
+            }
+            return v;
+        }();
+        for (const std::string& o : overlays) {
+            std::string alt = case_insensitive(o, o + "/content/" + r.substr(gc.size()));
+            struct stat st;
+            if (stat(alt.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return alt;
+        }
+    }
     if (r.compare(0, g.size(), g) == 0 && guest.compare(0, 9, "/vol/save") != 0) return case_insensitive(g, r);
     return r;
 }

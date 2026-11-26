@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">The Wind Waker HD</string>
+    <string name="touch_skip">تخطي</string>
+    <string name="restart_needed">يتم التطبيق بعد إعادة التشغيل.</string>
+
+    <!-- General Options -->
+    <string name="opt_on">مفعل</string>
+    <string name="opt_off">معطل</string>
+    <string name="opt_ok">حسناً</string>
+    <string name="opt_cancel">إلغاء</string>
+    <string name="opt_tab_game">اللعبة</string>
+    <string name="opt_tab_graphics">الرسوميات</string>
+    <string name="opt_tab_controls">التحكم</string>
+    <string name="opt_tab_saves">الحفظ</string>
+    <string name="opt_tab_mods">المودات والتعريب</string>
+
+    <!-- Language -->
+    <string name="opt_language">لغة اللعبة</string>
+    <string name="opt_language_hint">لغة اللعبة الأصلية أو التعريب؛ يتم التطبيق بعد إعادة التشغيل</string>
+    <string name="language_ptbr">Português (Brasil)</string>
+    <string name="language_arabic">العربية (ترجمة هشام)</string>
+    <string name="opt_app_language">لغة التطبيق</string>
+    <string name="opt_app_language_hint">لغة قوائم وإشعارات هذا التطبيق</string>
+    <string-array name="app_languages">
+        <item>لغة النظام</item>
+        <item>English</item>
+        <item>Português (Brasil)</item>
+        <item>Español</item>
+        <item>العربية</item>
+    </string-array>
+    <string name="opt_menu_size">حجم القوائم</string>
+    <string name="opt_menu_size_hint">حجم عرض قوائم الإعدادات</string>
+
+    <!-- Arabic Translation (Hesham) -->
+    <string name="opt_arabic">ترجمة هشام (العربية)</string>
+    <string name="opt_arabic_hint">تعريب كامل للنصوص والشعار بواسطة هشام (arabichesham.com) مع دعم الكتابة من اليمين لليسار</string>
+    <string name="opt_arabic_import">استيراد ملفات الترجمة (.zip)…</string>
+    <string name="opt_arabic_import_other">استيراد حزمة ترجمة أخرى (.zip)…</string>
+    <string name="opt_arabic_import_hint">اختر ملف .zip المحمّل من موقع تعريبات هشام (arabichesham.com)</string>
+    <string name="arabic_install_folder">استيراد من مجلد…</string>
+    <string name="arabic_install_folder_hint">اختر مجلداً يحتوي على ملفات التعريب</string>
+    <string name="arabic_about">ترجمة اللعبة إلى اللغة العربية بواسطة الأخ هشام (Arabic Hesham). يدعم هذا الإصدار قراءة وتنسيق النصوص العربية تلقائياً من اليمين إلى اليسار (RTL) بالإضافة إلى شعار البداية المعرب.</string>
+    <string name="arabic_restart">ستعمل اللعبة باللغة العربية بعد إعادة التشغيل.</string>
+    <string name="arabic_on_restart">تم تفعيل التعريب العربي. ستعمل اللعبة به بعد إعادة التشغيل.</string>
+    <string name="arabic_off_restart">تم تعطيل التعريب. ستعود اللعبة للغتها الأصلية بعد إعادة التشغيل.</string>
+    <string name="arabic_none">غير مُثبت</string>
+    <string name="arabic_partial">ملفات جزئية (نصوص اللعبة فقط)</string>
+    <string name="arabic_installed">مُثبت بالكامل (النصوص وشعار البداية)</string>
+    <string name="arabic_installed_status">حالة التعريب: %1$s</string>
+    <string name="arabic_installing">جارٍ تثبيت ملفات التعريب العربي…</string>
+    <string name="arabic_install_failed">فشل تثبيت ملفات التعريب: %1$s</string>
+    <string name="arabic_not_package">لم يتم العثور على حزمة ترجمة صالحة (ملف .zip يحتوي على permanent_2d_*.pack)</string>
+    <string name="arabic_both">نصوص اللعبة وشعار البداية المعرب</string>
+    <string name="arabic_text_only">نصوص اللعبة (الأرشيف لا يحتوي على شعار البداية)</string>
+    <string name="arabic_installed_restart">تم تثبيت %1$s بنجاح.\nسيبدأ استخدام التعريب بعد إعادة التشغيل.</string>
+    <string name="arabic_remove">إزالة ملفات التعريب</string>
+    <string name="arabic_remove_confirm">هل أنت متأكد من حذف ملفات التعريب العربي المثبتة؟</string>
+
+    <!-- Content Packs -->
+    <string name="opt_packs">حزم المحتوى (مودات Cemu)</string>
+    <string name="opt_packs_hint">حزم رسومية تستبدل ملفات اللعبة: مجسمات، أشكال، نصوص</string>
+    <string name="packs_install">تثبيت حزمة من مجلد…</string>
+    <string name="packs_install_hint">مجلد حزمة رسومية غير مضغوطة من Cemu</string>
+    <string name="packs_installing">جارٍ تثبيت حزمة المحتوى…</string>
+    <string name="packs_failed">تعذر تثبيت الحزمة: %1$s</string>
+    <string name="packs_not_found">لم يتم العثور على مجلد content داخل الحزمة.</string>
+    <string name="packs_remove">إزالة %1$s</string>
+
+    <!-- Portuguese -->
+    <string name="opt_ptbr">الترجمة البرتغالية (البرازيل)</string>
+    <string name="opt_ptbr_hint">ترجمة نصوص اللعبة للبرتغالية بواسطة Triforce-Heroes</string>
+    <string name="ptbr_not_installed">غير مثبتة</string>
+
+    <!-- Cheats & Mods -->
+    <string name="opt_cheats">الغش والمساعدات</string>
+    <string name="opt_cheats_hint">تعديل ملف الحفظ: أدوات، قلوب كاملة، طاقة سحرية غير محدودة</string>
+    <string name="opt_button_style">شكل أزرار التحكم</string>
+    <string name="opt_button_style_hint">أشكال أزرار التحكم باللمس وفي اللعبة (Wii U، Xbox، PlayStation)</string>
+    <string name="opt_mod_direct_camera">تحكم حر بالكاميرا</string>
+    <string name="opt_mod_direct_camera_hint">تحريك الكاميرا بحرية بواسطة العصا اليمنى</string>
+    <string name="opt_mod_climb">التسلق المحسن</string>
+    <string name="opt_mod_climb_hint">تسلق الأسطح العمودية بحرية</string>
+    <string name="opt_mod_quick_doors">أبواب سريعة</string>
+    <string name="opt_mod_speed_hint">تسريع الرسوم المتحركة عند فتح الأبواب والعبور</string>
+    <string name="opt_mod_fast_scenes">مشاهد سريعة</string>
+    <string name="opt_mod_ff_cutscenes">تسريع المشاهد السينمائية</string>
+    <string name="opt_mod_ff_dialogues">تسريع الحوارات</string>
+
+    <!-- Graphics -->
+    <string name="opt_light">الرسوميات</string>
+    <string name="opt_light_hint">وضع خفيف: للأجهزة الضعيفة، بدون ظلال بعيدة أو انسداد محيطي</string>
+    <string name="opt_res_scale">دقة العرض</string>
+    <string name="opt_res_scale_hint">دقة التصيير ثلاثي الأبعاد</string>
+    <string name="opt_fps">معدل الإطارات (FPS)</string>
+    <string name="opt_fps_hint">30 أو 60 إطاراً في الثانية</string>
+
+    <!-- Restart Dialogs -->
+    <string name="gpu_driver_later">لاحقاً</string>
+    <string name="res_restart_now">إعادة التشغيل الآن</string>
+    <string name="button_style_restart">تتغير أشكال الأزرار بعد إعادة التشغيل.</string>
+</resources>

@@ -20,16 +20,22 @@
 #include <thread>
 
 #include "gx2/gx2.h"
+#include "android/perf_hint.h"
 #include "lsfg.h"
+#include "reproj.h"
 #include "platform.h"
+#include "interp.h"
 #include "runtime.h"
 #include "vk.h"
 #include "vk_window.h"
+#include "vertex_cpu_policy.h"
 #include "../aspect.h"
+namespace interp { bool mode40(); }  // interp.cpp: 40 fps needs the panel at 120 Hz
 
 namespace gfx {
 Renderer R;
 namespace { void count_present(); }
+static std::atomic<bool> g_fast_forward{false};  // set_fast_forward: no generated frames
 
 const char* backend_name() { return "Vulkan"; }
 uint64_t current_frame() { return R.frame; }
@@ -63,7 +69,9 @@ Chunk* new_chunk(VkDeviceSize size) {
     // compare guest data with what earlier draws already copied here (vk_draw.cpp, copy_deduped)
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;  // written without explicit flushes
-    ai.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    // debug: WWHD_UPLOAD_UNCACHED=1 avoids cached memory (GPU reads of it may be snooped)
+    static const bool uncached = getenv("WWHD_UPLOAD_UNCACHED") != nullptr;
+    if (!uncached) ai.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     VmaAllocationInfo info{};
     VK_CHECK(vmaCreateBuffer(R.vma, &bi, &ai, &c->buf, &c->alloc, &info));
     c->ptr = (uint8_t*)info.pMappedData;
@@ -82,6 +90,26 @@ Chunk* new_chunk(VkDeviceSize size) {
 std::vector<VkDescriptorPool> g_pool_free, g_pool_used;
 VkDescriptorPool g_pool_cur = VK_NULL_HANDLE;
 }  // namespace
+
+// Free upload chunks beyond a few are given back (every 300 frames): an area's load uploads hundreds
+// of MB of textures in a few frames, and the chunks it took stayed allocated for the session (~600 MB
+// of the memory Android ended the game for). Larger-than-standard ones go first.
+static void trim_upload_chunks() {
+    constexpr size_t kKeep = 4;
+    if (R.frame % 300) return;
+    std::sort(g_chunk_free.begin(), g_chunk_free.end(), [](const Chunk* a, const Chunk* b) { return a->size < b->size; });
+    size_t freed = 0;
+    VkDeviceSize bytes = 0;
+    while (!g_chunk_free.empty() && (g_chunk_free.size() > kKeep || g_chunk_free.back()->size > kChunkSize)) {
+        Chunk* c = g_chunk_free.back();
+        g_chunk_free.pop_back();
+        bytes += c->size;
+        vmaDestroyBuffer(R.vma, c->buf, c->alloc);
+        delete c;
+        freed++;
+    }
+    if (freed) LOG("[vk] gave back %zu upload chunks (%llu MB)", freed, (unsigned long long)(bytes >> 20));
+}
 
 Upload upload_alloc(VkDeviceSize size, VkDeviceSize align) {
     align = std::max<VkDeviceSize>(align, 4);
@@ -108,6 +136,7 @@ Upload upload(const void* data, VkDeviceSize size, VkDeviceSize align) {
     memcpy(u.ptr, data, size);
     return u;
 }
+
 
 VkDescriptorSet alloc_descriptor_set(VkDescriptorSetLayout layout) {
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -209,7 +238,11 @@ uint64_t thread_cpu_ns() {
 
 void record_thread_main() {
     platform::set_thread_name("GX2 record");
-    platform::set_thread_high_priority();  // also joins the performance hint session (Android)
+    platform::set_thread_high_priority();
+#ifdef __ANDROID__
+    perf_hint::register_record_thread();
+    platform::apply_thread_cores(true);
+#endif
     std::deque<RecordFlight> flights;
     std::vector<VkFence> fences;
     std::vector<VkCommandBuffer> commands;
@@ -235,6 +268,7 @@ void record_thread_main() {
             pi.pImageIndices = &job.imageIndex;
             VkResult r;
             {
+                std::lock_guard<std::mutex> sl(R.swapchainMutex);
                 std::lock_guard<std::mutex> lk(R.queueMutex);
                 r = vkQueuePresentKHR(R.queue, &pi);
             }
@@ -291,6 +325,7 @@ void record_thread_main() {
                 std::lock_guard<std::mutex> lk(R.queueMutex);
                 VK_CHECK(vkQueueSubmit(R.queue, 1, &si, fence));
             }
+            rec::crumbs_submitted();
             g_record_cpu_ns.fetch_add(thread_cpu_ns() - cpu0, std::memory_order_relaxed);
             g_record_stream_bytes.fetch_add(streamBytes, std::memory_order_relaxed);
             g_record_streams.fetch_add(1, std::memory_order_relaxed);
@@ -526,7 +561,9 @@ void end_pass() {
         prof_pass_end();
         R.pass = VK_NULL_HANDLE;
         // submit work in chunks so the GPU starts while the frame is still being built (like the
-        // hardware command processor), instead of all at once on swap
+        // hardware command processor), instead of all at once on swap. The flicker of the distant
+        // shading it seemed to cause was dynamic state inherited across command buffers (fixed in
+        // record_draw's pass state). WWHD_NO_CHUNK=1: one submission per frame.
         static const bool chunked = getenv("WWHD_NO_CHUNK") == nullptr;
         if (chunked && g_draws_since_commit_ >= 1024) submit();
     }
@@ -544,7 +581,7 @@ void wait_idle() {
 
 // GX2DrawDone. The game waits here before reusing memory the GPU reads, or to read what it wrote.
 // This renderer copies all guest data (vertices, uniforms, textures) when commands are recorded and
-// never writes results back to guest memory, so once the render thread has processed the commands
+// writes results back to guest memory only for linear surfaces (write_back_linear), so once the render thread has processed the commands
 // (the caller syncs with it) there is nothing left to wait for. Waiting for the GPU as well would
 // serialize CPU and GPU: WWHD calls this twice a frame, which kept the GPU half idle and at its
 // lowest clock. Frame pacing still waits for finished frames (flips). WWHD_STRICT_DRAWDONE=1 waits.
@@ -552,6 +589,7 @@ void draw_done() {
     static const bool strict = getenv("WWHD_STRICT_DRAWDONE") != nullptr;
     if (strict) wait_idle();
     else submit();
+    write_back_linear();  // except what the CPU reads: linear targets (the Picto Box picture, issue #22)
 }
 
 // ---------------------------------------------------------------- image layouts
@@ -601,10 +639,32 @@ static VkAccessFlags use_accesses(Use u) {
     }
 }
 
+void flush_pending_clear(Image& img) {
+    const uint32_t layers = img.pendingClearLayers;
+    if (!layers || !img.image) return;
+    img.pendingClearLayers = 0;
+    prepare(img, Use::COPY_DST);
+    VkCommandBuffer cmd = command_buffer();
+    for (uint32_t first = 0; first < 32 && first < img.layers; first++) {
+        if (!(layers >> first & 1)) continue;
+        uint32_t n = 1;
+        while (first + n < 32 && first + n < img.layers && (layers >> (first + n) & 1)) n++;
+        VkImageSubresourceRange range{img.pendingClearAspect, 0, 1, first, n};
+        if (img.pendingClearAspect & VK_IMAGE_ASPECT_COLOR_BIT)
+            vkCmdClearColorImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &img.pendingClearValue.color, 1, &range);
+        else
+            vkCmdClearDepthStencilImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &img.pendingClearValue.depthStencil, 1, &range);
+        first += n - 1;
+    }
+}
+
 void prepare(Image& img, Use use) {
     if (!img.image) return;
+    if (img.pendingClearLayers) flush_pending_clear(img);
     // render passes order attachment writes among themselves (subpass dependencies); reads after reads need nothing
     if (img.use == use && (use == Use::SAMPLED || use == Use::COLOR || use == Use::DEPTH)) return;
+    if (R.pass && log_this_frame())
+        LOG("[pass] ends: image %ux%u fmt %d use %d -> %d", img.width, img.height, (int)img.format, (int)img.use, (int)use);
     end_pass();
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     const bool broad = broad_barriers();
@@ -699,7 +759,8 @@ static bool has_ext(const std::vector<VkExtensionProperties>& exts, const char* 
 }
 
 // one pipeline cache per driver (a user-installed GPU driver and the system's keep their own);
-// pipelines.vkcache is the name builds before that used
+// pipelines.vkcache and pipelines-*.vkcache are the names of builds before (the latter holds pipelines
+// of shaders translated before strictMul: not loaded, so they don't stay in the cache for good)
 static std::string pipeline_cache_path(bool legacy = false) {
     std::string dir = config::cache_dir.empty() ? "." : config::cache_dir;
     if (legacy) return dir + "/pipelines.vkcache";
@@ -711,15 +772,40 @@ static std::string pipeline_cache_path(bool legacy = false) {
     mix(&R.props.deviceID, 4);
     mix(R.props.pipelineCacheUUID, VK_UUID_SIZE);
     char name[40];
-    snprintf(name, sizeof name, "/pipelines-%08x.vkcache", h);
+    snprintf(name, sizeof name, "/pipelines2-%08x.vkcache", h);
     return dir + name;
+}
+static std::string pipeline_cache_path_v1() {
+    std::string p = pipeline_cache_path();
+    return p.replace(p.rfind("/pipelines2-"), 12, "/pipelines-");
+}
+
+// Qualcomm's older drivers (v502 on the Adreno 640/650, issue #25) sometimes build broken pipelines
+// when several threads create them at once with a pipeline cache; the GPU then hangs each time one is
+// drawn with (about every second start on a Mi 9, mostly in the first seconds while the shader cache
+// is replayed). Not with one thread at a time (0 in 25 starts), nor without the cache, nor with a
+// cache for each thread (5 in 15). There pipelines are created one at a time; the shaders' translation
+// stays parallel. The tablet's v762 never hung. WWHD_SERIAL_PIPELINES=0/1 overrides.
+static bool serial_pipelines() {
+    static const bool on = [] {
+        if (const char* e = getenv("WWHD_SERIAL_PIPELINES")) return strcmp(e, "0") != 0;
+        const uint32_t v = (R.props.driverVersion >> 12) & 0x3FF;
+        return R.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && v < 700;
+    }();
+    return on;
+}
+static std::mutex g_pipeline_mutex;  // with serial_pipelines: creation and saving the cache
+
+VkResult create_graphics_pipeline(const VkGraphicsPipelineCreateInfo* ci, VkPipeline* out) {
+    if (!serial_pipelines()) return vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, ci, nullptr, out);
+    std::lock_guard<std::mutex> lk(g_pipeline_mutex);
+    return vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, ci, nullptr, out);
 }
 
 static void load_pipeline_cache() {
     std::vector<uint8_t> data;
     if (const char* e = getenv("WWHD_SHADER_CACHE"); !(e && !strcmp(e, "0"))) {
         FILE* f = fopen(pipeline_cache_path().c_str(), "rb");
-        if (!f) f = fopen(pipeline_cache_path(true).c_str(), "rb");  // the header check below decides if it fits
         if (f) {
             fseek(f, 0, SEEK_END);
             long n = ftell(f);
@@ -744,6 +830,10 @@ static void load_pipeline_cache() {
             data.clear();
         }
     }
+    if (getenv("WWHD_NO_PIPELINE_CACHE")) {  // debug: pipelines compiled without the driver's cache
+        LOG("[vk] pipeline cache off (WWHD_NO_PIPELINE_CACHE)");
+        return;
+    }
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -754,20 +844,30 @@ static void load_pipeline_cache() {
         VK_CHECK(vkCreatePipelineCache(R.device, &ci, nullptr, &R.pipelineCache));
     }
     if (!data.empty()) LOG("[vk] pipeline cache: %zu KiB", data.size() / 1024);
+    if (serial_pipelines()) LOG("[vk] pipelines are created one at a time (%s)", R.driverInfo.c_str());
 }
 
+// render thread (every 1800 frames with new pipelines) and UI thread (app paused)
 void save_caches() {
     if (!R.pipelineCache) return;
     if (const char* e = getenv("WWHD_SHADER_CACHE"); e && !strcmp(e, "0")) return;
+    static std::mutex saving;
+    std::lock_guard<std::mutex> sl(saving);
+    std::unique_lock<std::mutex> lk(g_pipeline_mutex, std::defer_lock);
+    if (serial_pipelines()) lk.lock();
     size_t n = 0;
     if (vkGetPipelineCacheData(R.device, R.pipelineCache, &n, nullptr) != VK_SUCCESS || !n) return;
     std::vector<uint8_t> data(n);
     if (vkGetPipelineCacheData(R.device, R.pipelineCache, &n, data.data()) != VK_SUCCESS) return;
+    lk = {};
     std::string path = pipeline_cache_path(), tmp = path + ".tmp";
     if (FILE* f = fopen(tmp.c_str(), "wb")) {
         bool ok = fwrite(data.data(), 1, n, f) == n;
         ok &= fclose(f) == 0;
-        if (ok && rename(tmp.c_str(), path.c_str()) == 0) remove(pipeline_cache_path(true).c_str());
+        if (ok && rename(tmp.c_str(), path.c_str()) == 0) {
+            remove(pipeline_cache_path(true).c_str());
+            remove(pipeline_cache_path_v1().c_str());
+        }
     }
 }
 
@@ -878,6 +978,15 @@ static void create_device() {
             VK_API_VERSION_MINOR(R.props.apiVersion), VK_API_VERSION_PATCH(R.props.apiVersion));
     }
 
+    // PowerVR decodes some byte-swapped vertex attributes wrongly in the shader (issue #21): those are
+    // decoded on the CPU; decided before the first shader is translated (their inputs change with it)
+    {
+        const CpuVertexChoice c = choose_cpu_vertices(R.props.vendorID, getenv("WWHD_VK_VERTEX_CPU"));
+        R.vertexCpuClasses = g_latteCpuVertexClasses = c.mask;
+        if (c.mask || getenv("WWHD_VK_VERTEX_CPU"))
+            LOG("[vk] vertex attributes decoded on the CPU: %s (%s)", cpu_vertex_class_names(c.mask).c_str(), c.reason);
+    }
+
     vkGetPhysicalDeviceQueueFamilyProperties(R.pd, &n, nullptr);
     std::vector<VkQueueFamilyProperties> qf(n);
     vkGetPhysicalDeviceQueueFamilyProperties(R.pd, &n, qf.data());
@@ -953,6 +1062,9 @@ static void create_device() {
     vi.physicalDevice = R.pd;
     vi.device = R.device;
     vi.instance = R.instance;
+    // 64 MB blocks instead of 256 MB: textures freed by area left most blocks partly used (1.76 GB
+    // of blocks for 1.03 GB of allocations), and a block goes back to the system only when empty
+    vi.preferredLargeHeapBlockSize = 64ull << 20;
     VK_CHECK(vmaCreateAllocator(&vi, &R.vma));
 
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -987,7 +1099,13 @@ void main() {
     vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);   // triangle strip corners
     uv = p * 0.5;
     vec2 ndc = pc.rect.xy + p * 0.5 * pc.rect.zw;                    // 0..1 within the window
-    gl_Position = vec4(ndc * 2.0 - 1.0, 0.0, 1.0);
+    vec2 q = ndc * 2.0 - 1.0;
+    // opts.y: quarter turns of the swapchain's pre-transform (the display's native orientation)
+    int rot = int(pc.opts.y + 0.5);
+    if (rot == 1) q = vec2(-q.y, q.x);
+    else if (rot == 2) q = -q;
+    else if (rot == 3) q = vec2(q.y, -q.x);
+    gl_Position = vec4(q, 0.0, 1.0);
 }
 )";
 const char* kPresentFS = R"(#version 450
@@ -1008,7 +1126,10 @@ struct Swapchain {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    VkExtent2D extent{};
+    VkExtent2D extent{};  // the window's size in its current orientation (layout coordinates)
+    VkExtent2D phys{};    // the images' size: the extent in the display's native orientation
+    uint32_t rot = 0;     // quarter turns the present pass applies (pre-transform)
+    VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
     std::vector<VkFramebuffer> fbs;
@@ -1103,7 +1224,7 @@ VkPipeline create_present_pipeline(VkRenderPass pass) {
     pi.layout = g_present_layout;
     pi.renderPass = pass;
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, &pi, nullptr, &p));
+    VK_CHECK(create_graphics_pipeline(&pi, &p));
     return p;
 }
 
@@ -1124,13 +1245,61 @@ void destroy_swapchain(Swapchain& sc, bool keepSurface) {
     }
 }
 
-// g_window_mutex held; true if a swapchain is ready. `main`: the game window (frame generation
+// rotate in the present pass (see ensure_swapchain); WWHD_NO_PRETRANSFORM=1 leaves it to the compositor
+const bool g_pretransform = getenv("WWHD_NO_PRETRANSFORM") == nullptr;
+
+// API 30's entry point only changes refresh rate when the transition is seamless. ColorOS can
+// otherwise engage FRTC at an intermediate rate (55 Hz was observed while 60 Hz was requested).
+// Resolve the API 31 entry point at runtime because the app still supports Android 11.
+void request_window_frame_rate(ANativeWindow* window, float hz, int8_t compatibility) {
+    using SetWithStrategy = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+    static auto setWithStrategy = reinterpret_cast<SetWithStrategy>(
+        dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy"));
+    int32_t r;
+    if (setWithStrategy && !getenv("WWHD_FRAME_RATE_SEAMLESS"))
+        r = setWithStrategy(window, hz, compatibility, int8_t{1});  // CHANGE_FRAME_RATE_ALWAYS (API 31)
+    else
+        r = ANativeWindow_setFrameRate(window, hz, compatibility);
+    if (r) LOG("[vk] window frame-rate request %.1f Hz failed: %d", hz, r);
+}
+// The display rate the window asks for, from the frames shown per second (30, or what frame
+// interpolation draws: interp::frames_per_step). Frame generation presents a steady multiple of it
+// (a 144 Hz panel can't space 60 or 120 fps evenly; 120 Hz can); without it at least 60 Hz, more for
+// interpolation at 120 fps. Checked every frame (the frame rate setting changes during play); Android
+// is asked only when it changes, or for a new window (force).
 static bool no_60hz_request() {
     static const bool off = getenv("WWHD_NO_60HZ") != nullptr;
     return off;
 }
+// frame generation: the LSFG network (lsfg.cpp, the user's Lossless.dll) or the built-in reprojection
+// (reproj.cpp, "60 fps (generated)"); both present through present_frame_fg and its present thread
+static bool gen_on() { return fg::loaded() || rp::enabled(); }
+static int gen_multiplier() { return rp::enabled() ? 2 : fg::config().multiplier; }
+static float g_rate_requested = -1.0f;
+static void request_display_rate(ANativeWindow* window, bool force) {
+    if (!window) return;
+    const int shown = 30 * interp::frames_per_step();
+    float rate;
+    int8_t compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT;
+    if (gen_on()) {
+        // the built-in reprojection doubles the game's own 30 fps; LSFG multiplies what is drawn
+        rate = (float)((rp::enabled() ? 30 : shown) * gen_multiplier());
+        compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE;
+    } else {
+        // without it the game flips at most 60 times a second (more with interpolation): let a 90/120 Hz
+        // panel drop to 60 Hz (from pull request #8 by SSunnKing, 62a723b); WWHD_NO_60HZ=1 leaves it alone
+        rate = no_60hz_request() ? 0.0f : (float)std::max(60, shown);
+        if (interp::mode40()) rate = 120.0f;  // 40 fps: a frame every 3 refreshes of a 120 Hz panel
+    }
+    if (!force && rate == g_rate_requested) return;
+    g_rate_requested = rate;
+    request_window_frame_rate(window, rate, compat);
+    LOG("[vk] display rate requested: %.0f Hz%s", rate, gen_on() ? " (frame generation)" : "");
+}
 
+// g_window_mutex held; true if a swapchain is ready. `main`: the game window (frame generation
 // presents there); else the GamePad's own display
+
 bool ensure_swapchain(Swapchain& sc, bool main = true) {
     if (!sc.window) return false;
     if (sc.sc && !sc.stale) return true;
@@ -1148,13 +1317,7 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
         vkGetPhysicalDeviceSurfaceSupportKHR(R.pd, R.queueFamily, sc.surface, &ok);
         if (!ok) LOG("[vk] warning: queue family %u reports no present support", R.queueFamily);
     }
-    // frame generation presents at a steady multiple of the game's 30 fps: ask for a display mode
-    // that is a multiple of it (a 144 Hz panel can't space 60 or 120 fps evenly; 120 Hz can)
-    if (main && fg::loaded()) ANativeWindow_setFrameRate(sc.window, 30.0f * fg::config().multiplier,
-                                                 ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-    // without it the game flips at most 60 times a second: let a 90/120 Hz panel drop to 60 Hz
-    // (from pull request #8 by SSunnKing, 62a723b); WWHD_NO_60HZ=1 leaves the panel's rate alone
-    else if (main && !no_60hz_request()) ANativeWindow_setFrameRate(sc.window, 60.0f, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+    if (main) request_display_rate(sc.window, true);
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(R.pd, sc.surface, &caps);
     uint32_t n = 0;
@@ -1169,7 +1332,7 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
             fmt = f;
             break;
         }
-    // the window's size in its current orientation; the compositor applies any rotation
+    // the window's size in its current orientation (layout coordinates; the images may be rotated)
     VkExtent2D ext{(uint32_t)ANativeWindow_getWidth(sc.window), (uint32_t)ANativeWindow_getHeight(sc.window)};
     if (!ext.width || !ext.height) return false;
     vkGetPhysicalDeviceSurfacePresentModesKHR(R.pd, sc.surface, &n, nullptr);
@@ -1179,7 +1342,7 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
     // With frame generation the present thread paces the frames and each one must be shown: FIFO.
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     for (auto m : modes)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !(main && fg::loaded())) mode = m;
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !(main && gen_on())) mode = m;
 
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = sc.surface;
@@ -1187,12 +1350,22 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
     ci.imageFormat = fmt.format;
     ci.imageColorSpace = fmt.colorSpace;
-    ci.imageExtent = ext;
+    // rotate in the present pass instead of letting the compositor rotate every frame
+    // (often an extra GPU pass); WWHD_NO_PRETRANSFORM=1 restores the compositor rotation
+    uint32_t rot = 0;
+    if (g_pretransform && main) {  // the GamePad display: left to the compositor
+        if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) rot = 1;
+        else if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) rot = 2;
+        else if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) rot = 3;
+    }
+    VkExtent2D phys = rot & 1 ? VkExtent2D{ext.height, ext.width} : ext;
+    ci.imageExtent = phys;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
-                                                                                        : caps.currentTransform;
+    ci.preTransform = rot ? caps.currentTransform
+                          : (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                                                                                                : caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;  // Android often offers only INHERIT
     for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
                                           VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
@@ -1237,6 +1410,9 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
         sc.format = fmt.format;
     }
     sc.extent = ext;
+    sc.phys = phys;
+    sc.rot = rot;
+    sc.transform = caps.currentTransform;
     vkGetSwapchainImagesKHR(R.device, sc.sc, &n, nullptr);
     sc.images.resize(n);
     vkGetSwapchainImagesKHR(R.device, sc.sc, &n, sc.images.data());
@@ -1253,8 +1429,8 @@ bool ensure_swapchain(Swapchain& sc, bool main = true) {
         fi.renderPass = sc.pass;
         fi.attachmentCount = 1;
         fi.pAttachments = &v;
-        fi.width = ext.width;
-        fi.height = ext.height;
+        fi.width = phys.width;
+        fi.height = phys.height;
         fi.layers = 1;
         VkFramebuffer fb;
         VK_CHECK(vkCreateFramebuffer(R.device, &fi, nullptr, &fb));
@@ -1280,10 +1456,25 @@ void fit(const ScreenRect& r, float a, float out[4], VkExtent2D ext, int mode = 
     float W = (float)ext.width, H = (float)ext.height;
     float x = r.x, y = r.y, w = r.w, h = r.h;
     if (w <= 0 || h <= 0) { x = 0; y = 0; w = W; h = H; }
+    // a picture within 1% of the rect's shape fills it: the widened picture's size is rounded to
+    // whole pixels (2398 x 1080 in a 2400 x 1080 window), which left 1-pixel bars at the sides
+    if (std::fabs(w / h - a) < 0.01f * a) mode = 1;
     bool wider = w / h > a;
     if (mode == 0 ? wider : mode == 2 ? !wider : false) { x += (w - h * a) / 2; w = h * a; }
     else if (mode != 1) { y += (h - w / a) / 2; h = w / a; }
     out[0] = x / W; out[1] = y / H; out[2] = w / W; out[3] = h / H;
+}
+
+// a rect in window (layout) pixels -> the rotated image's pixels; matches the present vertex shader
+VkRect2D rotate_rect(VkRect2D r, VkExtent2D ext, uint32_t rot) {
+    int32_t W = (int32_t)ext.width, H = (int32_t)ext.height, x = r.offset.x, y = r.offset.y;
+    int32_t w = (int32_t)r.extent.width, h = (int32_t)r.extent.height;
+    switch (rot) {
+    case 1: return {{H - y - h, x}, {(uint32_t)h, (uint32_t)w}};
+    case 2: return {{W - x - w, H - y - h}, r.extent};
+    case 3: return {{y, W - x - w}, {(uint32_t)h, (uint32_t)w}};
+    default: return r;
+    }
 }
 
 // the shape of the TV picture's rect on screen: the aspect the game renders at in "screen" mode (aspect.cpp)
@@ -1292,7 +1483,7 @@ void report_tv_shape(const ScreenRect& r, VkExtent2D ext) {
     if (h > 0) aspect::set_window_aspect(w / h);
 }
 
-void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent2D ext, int mode = 0) {
+void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent2D ext, int mode = 0, uint32_t rot = 0) {
     if (!scr.img.image) return;
     float pc[8];
     fit(r, (float)scr.img.width / scr.img.height, pc, ext, mode);
@@ -1303,10 +1494,12 @@ void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent
             int32_t x1 = std::min((int32_t)ext.width, (int32_t)(r.x + r.w)), y1 = std::min((int32_t)ext.height, (int32_t)(r.y + r.h));
             sc = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
         }
+        sc = rotate_rect(sc, ext, rot);
         vkCmdSetScissor(cmd, 0, 1, &sc);
     }
     pc[4] = scr.srgb ? 1.0f : 0.0f;
-    pc[5] = pc[6] = pc[7] = 0;
+    pc[5] = (float)rot;
+    pc[6] = pc[7] = 0;
     VkDescriptorSet set = alloc_descriptor_set(g_present_dsl);
     if (!scr.view) scr.view = make_view(scr.img, VK_IMAGE_VIEW_TYPE_2D, 0, 1, {}, VK_IMAGE_ASPECT_COLOR_BIT);
     VkDescriptorImageInfo ii{R.linearClamp, scr.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -1320,9 +1513,20 @@ void draw_screen(VkCommandBuffer cmd, Screen& scr, const ScreenRect& r, VkExtent
     vkCmdPushConstants(cmd, g_present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
     if (mode == 2) {
-        VkRect2D full{{0, 0}, ext};
+        VkRect2D full = rotate_rect({{0, 0}, ext}, ext, rot);
         vkCmdSetScissor(cmd, 0, 1, &full);
     }
+}
+
+// SUBOPTIMAL: recreate when the window size or the display rotation changed (g_window_mutex held)
+bool swapchain_changed() {
+    if ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
+        (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height)
+        return true;
+    if (!g_pretransform) return false;  // the compositor rotates: SUBOPTIMAL is expected
+    VkSurfaceCapabilitiesKHR caps{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(R.pd, g_sc.surface, &caps);
+    return caps.currentTransform != g_sc.transform;
 }
 
 // performance overlay: frames presented (game frames, or with frame generation all presented frames)
@@ -1335,6 +1539,7 @@ bool present_frame() {
     std::lock_guard<std::mutex> wl(g_window_mutex);
     if (g_present_outdated.exchange(false, std::memory_order_acquire)) g_sc.stale = true;
     if (!ensure_swapchain(g_sc)) return false;
+    request_display_rate(g_sc.window, false);
     VkSemaphore acquire;
     if (!g_acquire_free.empty()) {
         acquire = g_acquire_free.back();
@@ -1345,16 +1550,23 @@ bool present_frame() {
     }
     uint32_t idx = 0;
     // a short timeout: a window that isn't being composited must not stall the game
-    VkResult r = vkAcquireNextImageKHR(R.device, g_sc.sc, 100 * 1000000ull, acquire, VK_NULL_HANDLE, &idx);
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> sl(R.swapchainMutex);
+        // Fast Forward (mods/turbo.cpp): no wait for a window image - a FIFO swapchain (frame generation's) shows at most
+        // one picture per refresh, and waiting for it held the game's 3x / 4x to the display's rate (as the original
+        // project's #268): a step without a free image is simply not shown
+        r = vkAcquireNextImageKHR(R.device, g_sc.sc, g_fast_forward.load(std::memory_order_relaxed) ? 0 : 100 * 1000000ull, acquire,
+                                  VK_NULL_HANDLE, &idx);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT || r == VK_NOT_READY || r < 0) {
         if (r != VK_TIMEOUT && r != VK_NOT_READY) g_sc.stale = true;
         g_acquire_free.push_back(acquire);  // unsignaled
         return false;
     }
     // SUBOPTIMAL is normal on Android when the compositor rotates the image (identity pre-transform):
-    // recreate only when the window size changed
-    if (r == VK_SUBOPTIMAL_KHR && ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
-                                   (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height))
+    // recreate only when the window size or the display rotation changed
+    if (r == VK_SUBOPTIMAL_KHR && swapchain_changed())
         g_sc.stale = true;
     if (R.tv.img.image) prepare(R.tv.img, Use::SAMPLED);
     if (R.drc.img.image) prepare(R.drc.img, Use::SAMPLED);
@@ -1365,18 +1577,18 @@ bool present_frame() {
     VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = g_sc.pass;
     bi.framebuffer = g_sc.fbs[idx];
-    bi.renderArea = {{0, 0}, g_sc.extent};
+    bi.renderArea = {{0, 0}, g_sc.phys};
     bi.clearValueCount = 1;
     bi.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp{0, 0, (float)g_sc.extent.width, (float)g_sc.extent.height, 0, 1};
-    VkRect2D sc{{0, 0}, g_sc.extent};
+    VkViewport vp{0, 0, (float)g_sc.phys.width, (float)g_sc.phys.height, 0, 1};
+    VkRect2D sc{{0, 0}, g_sc.phys};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sc.pipeline);
     report_tv_shape(g_tv_rect, g_sc.extent);
-    draw_screen(cmd, R.tv, g_tv_rect, g_sc.extent, g_tv_aspect.load(std::memory_order_relaxed));
-    if (g_drc_visible) draw_screen(cmd, R.drc, g_drc_rect, g_sc.extent);
+    draw_screen(cmd, R.tv, g_tv_rect, g_sc.extent, g_tv_aspect.load(std::memory_order_relaxed), g_sc.rot);
+    if (g_drc_visible) draw_screen(cmd, R.drc, g_drc_rect, g_sc.extent, 0, g_sc.rot);
     vkCmdEndRenderPass(cmd);
     on_complete([acquire] { g_acquire_free.push_back(acquire); });
     uint64_t submitId = submit(acquire, g_sc.renderDone[idx]);
@@ -1390,6 +1602,7 @@ bool present_frame() {
         pi.pSwapchains = &g_sc.sc;
         pi.pImageIndices = &idx;
         {
+            std::lock_guard<std::mutex> sl(R.swapchainMutex);
             std::lock_guard<std::mutex> lk(R.queueMutex);
             r = vkQueuePresentKHR(R.queue, &pi);
         }
@@ -1416,7 +1629,11 @@ void present_drc_window() {
         VK_CHECK(vkCreateSemaphore(R.device, &si, nullptr, &acquire));
     }
     uint32_t idx = 0;
-    VkResult r = vkAcquireNextImageKHR(R.device, g_sc_drc.sc, 10 * 1000000ull, acquire, VK_NULL_HANDLE, &idx);
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> sl(R.swapchainMutex);
+        r = vkAcquireNextImageKHR(R.device, g_sc_drc.sc, 10 * 1000000ull, acquire, VK_NULL_HANDLE, &idx);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT || r == VK_NOT_READY || r < 0) {
         if (r != VK_TIMEOUT && r != VK_NOT_READY) g_sc_drc.stale = true;
         g_drc_acquire_free.push_back(acquire);
@@ -1456,6 +1673,7 @@ void present_drc_window() {
         pi.pSwapchains = &g_sc_drc.sc;
         pi.pImageIndices = &idx;
         {
+            std::lock_guard<std::mutex> sl(R.swapchainMutex);
             std::lock_guard<std::mutex> lk(R.queueMutex);
             r = vkQueuePresentKHR(R.queue, &pi);
         }
@@ -1530,17 +1748,21 @@ bool fg_present(const Image* img) {
     PresentSlot& ps = g_fg_slots[g_fg_next];
     vkWaitForFences(R.device, 1, &ps.fence, VK_TRUE, UINT64_MAX);
     uint32_t idx = 0;
-    VkResult r = vkAcquireNextImageKHR(R.device, g_sc.sc, 100 * 1000000ull, ps.acquire, VK_NULL_HANDLE, &idx);
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> sl(R.swapchainMutex);
+        r = vkAcquireNextImageKHR(R.device, g_sc.sc, g_fast_forward.load(std::memory_order_relaxed) ? 0 : 100 * 1000000ull,
+                                  ps.acquire, VK_NULL_HANDLE, &idx);  // (Fast Forward: as present above)
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_TIMEOUT || r == VK_NOT_READY || r < 0) {
         if (r != VK_TIMEOUT && r != VK_NOT_READY) g_sc.stale = true;
         return false;
     }
-    if (r == VK_SUBOPTIMAL_KHR && ((uint32_t)ANativeWindow_getWidth(g_sc.window) != g_sc.extent.width ||
-                                   (uint32_t)ANativeWindow_getHeight(g_sc.window) != g_sc.extent.height))
+    if (r == VK_SUBOPTIMAL_KHR && swapchain_changed())
         g_sc.stale = true;
     g_fg_next = (g_fg_next + 1) % 3;
     vkResetFences(R.device, 1, &ps.fence);
-    VkImageView view = fg::view_of(img);
+    VkImageView view = rp::enabled() ? rp::view_of(img) : fg::view_of(img);
     if (!view) view = g_comp.view;
     VkDescriptorSet& set = g_fg_sets[view];
     if (!set) {
@@ -1573,16 +1795,16 @@ bool fg_present(const Image* img) {
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g_sc.pass;
     rb.framebuffer = g_sc.fbs[idx];
-    rb.renderArea = {{0, 0}, g_sc.extent};
+    rb.renderArea = {{0, 0}, g_sc.phys};
     rb.clearValueCount = 1;
     rb.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp{0, 0, (float)g_sc.extent.width, (float)g_sc.extent.height, 0, 1};
-    VkRect2D sc{{0, 0}, g_sc.extent};
+    VkViewport vp{0, 0, (float)g_sc.phys.width, (float)g_sc.phys.height, 0, 1};
+    VkRect2D sc{{0, 0}, g_sc.phys};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sc.pipeline);
-    float pc[8] = {0, 0, 1, 1, 0, 0, 0, 0};  // the whole window; already display encoded
+    float pc[8] = {0, 0, 1, 1, 0, (float)g_sc.rot, 0, 0};  // the whole window; already display encoded
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_present_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, g_present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
@@ -1604,6 +1826,7 @@ bool fg_present(const Image* img) {
     pi.pSwapchains = &g_sc.sc;
     pi.pImageIndices = &idx;
     {
+        std::lock_guard<std::mutex> sl(R.swapchainMutex);
         std::lock_guard<std::mutex> lk(R.queueMutex);
         VK_CHECK(vkQueueSubmit(R.queue, 1, &si, ps.fence));
         r = vkQueuePresentKHR(R.queue, &pi);
@@ -1729,6 +1952,7 @@ bool create_composite(uint32_t w, uint32_t h) {
 // ---- frame generation settings changed in the app: applied at the next frame boundary
 struct FgRequest {
     bool on = false;
+    bool builtin = false;  // the built-in reprojection (reproj.cpp) instead of the LSFG network
     fg::Config cfg;
 };
 std::mutex g_fg_req_mutex;
@@ -1743,7 +1967,7 @@ void apply_frame_generation() {
         r = g_fg_req;
         g_fg_req_pending = false;
     }
-    if (fg::loaded()) {
+    if (gen_on()) {
         // the present thread finishes what it has; then nothing uses the network's images
         wait_idle();
         fg_wait_present(true);
@@ -1758,13 +1982,17 @@ void apply_frame_generation() {
             if (g_fg_dpool) vkResetDescriptorPool(R.device, g_fg_dpool, 0);
         }
         destroy_composite();
-        fg::unload();
+        if (rp::enabled()) {
+            rp::set_enabled(false);
+            rp::destroy();
+        }
+        if (fg::loaded()) fg::unload();
     }
-    if (r.on) fg::load(r.cfg);  // logs why if the DLL can't be used
+    if (r.on && r.builtin) rp::set_enabled(true);
+    else if (r.on) fg::load(r.cfg);  // logs why if the DLL can't be used
     // present mode (FIFO with frame generation) and the display rate hint differ: new swapchain
     std::lock_guard<std::mutex> wl(g_window_mutex);
-    if (g_sc.window && !fg::loaded())
-        ANativeWindow_setFrameRate(g_sc.window, no_60hz_request() ? 0.0f : 60.0f, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+    if (g_sc.window) request_display_rate(g_sc.window, true);
     g_sc.stale = true;
 }
 
@@ -1781,6 +2009,7 @@ bool present_frame_fg() {
         if (!g_sc.window) return false;
         w = (uint32_t)ANativeWindow_getWidth(g_sc.window);
         h = (uint32_t)ANativeWindow_getHeight(g_sc.window);
+        request_display_rate(g_sc.window, false);
     }
     if (!w || !h) return false;
     if (w != g_comp.img.width || h != g_comp.img.height) {
@@ -1796,7 +2025,8 @@ bool present_frame_fg() {
         vkResetDescriptorPool(R.device, g_fg_dpool, 0);
         destroy_composite();
         if (!create_composite(w, h)) return false;
-        fg::resize(w, h, g_comp.view);
+        if (rp::enabled()) rp::resize(w, h);
+        else fg::resize(w, h, g_comp.view);
     }
     // the game's frame interval decides if generated frames fit the display's refresh rate
     static const double hz = getenv("WWHD_DISPLAY_HZ") ? atof(getenv("WWHD_DISPLAY_HZ")) : 60.0;
@@ -1808,7 +2038,8 @@ bool present_frame_fg() {
         if (d > 0.004 && d < 0.2) interval += (d - interval) * 0.1;
     }
     last = now;
-    bool generate = fg::config().multiplier / interval <= hz * 1.1;
+    // fast forward (mods/turbo.cpp): game frames only, the game's own frame rate is the point
+    bool generate = gen_multiplier() / interval <= hz * 1.1 && !g_fast_forward.load(std::memory_order_relaxed);
 
     if (R.tv.img.image) prepare(R.tv.img, Use::SAMPLED);
     if (R.drc.img.image) prepare(R.drc.img, Use::SAMPLED);
@@ -1841,7 +2072,42 @@ bool present_frame_fg() {
     if (drcVisible) draw_screen(cmd, R.drc, drcRect, {w, h});
     vkCmdEndRenderPass(cmd);
     FgJob job;
-    job.images = fg::record(cmd, generate);
+    if (rp::enabled()) {
+        float rect[4];
+        fit(tvRect, (float)R.tv.img.width / std::max(1u, R.tv.img.height), rect, {w, h}, g_tv_aspect.load(std::memory_order_relaxed));
+        job.images = rp::record(cmd, g_comp.img, g_comp.view, rect, generate && R.tv.img.image);
+        // test aid: WWHD_FRAMEGEN_DUMP=first,count writes the window pictures (real, then generated) of
+        // `count` frames from frame `first` as fg_<frame>_<0 real|1 generated>.png
+        static const uint64_t dumpFirst = getenv("WWHD_FRAMEGEN_DUMP") ? strtoull(getenv("WWHD_FRAMEGEN_DUMP"), nullptr, 10) : 0;
+        static const uint64_t dumpCount = [] {
+            const char* e = getenv("WWHD_FRAMEGEN_DUMP");
+            const char* c = e ? strchr(e, ',') : nullptr;
+            return c ? strtoull(c + 1, nullptr, 10) : 4ull;
+        }();
+        if (dumpFirst && R.frame >= dumpFirst && R.frame < dumpFirst + dumpCount)
+            for (size_t k = 0; k < job.images.size(); k++) {
+                Image& img = *const_cast<Image*>(job.images[k]);
+                img.layout = VK_IMAGE_LAYOUT_GENERAL;
+                img.use = Use::COLOR;
+                char name[64];
+                snprintf(name, sizeof name, "fg_%llu_%zu.png", (unsigned long long)R.frame, k);
+                dump_texture(img, name, true, false);
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.oldLayout = img.layout;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcAccessMask = 0;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = img.image;
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(command_buffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                                     nullptr, 1, &b);
+                img.layout = VK_IMAGE_LAYOUT_GENERAL;
+                img.use = Use::NONE;
+            }
+    } else {
+        job.images = fg::record(cmd, generate);
+    }
     uint64_t submitId = submit();
     wait_record_submitted(submitId);  // the present thread also submits to R.queue
     job.arrival = Clock::now();
@@ -1854,6 +2120,8 @@ bool present_frame_fg() {
     return true;
 }
 }  // namespace
+
+void set_fast_forward(bool on) { g_fast_forward.store(on, std::memory_order_relaxed); }
 
 void set_window(ANativeWindow* w) {
     std::lock_guard<std::mutex> wl(g_window_mutex);
@@ -1892,12 +2160,24 @@ void set_drc_window(ANativeWindow* w) {
 
 void request_frame_generation(bool on, const char* dll, bool quality, float flowScale, int multiplier, bool uiDetection) {
     std::lock_guard<std::mutex> lk(g_fg_req_mutex);
+    if (!(on && dll && *dll) && (rp::enabled() || (g_fg_req_pending && g_fg_req.builtin))) return;  // the built-in one is on
+    g_fg_req.builtin = false;
     g_fg_req.on = on && dll && *dll;
     g_fg_req.cfg.dll = dll ? dll : "";
     g_fg_req.cfg.performance = !quality;
     g_fg_req.cfg.flowScale = flowScale;
     g_fg_req.cfg.multiplier = multiplier;
     g_fg_req.cfg.uiDetection = uiDetection;
+    g_fg_req_pending = true;
+}
+
+// 60 fps (generated): the built-in reprojection on or off (at the next frame boundary)
+void request_builtin_frame_generation(bool on) {
+    std::lock_guard<std::mutex> lk(g_fg_req_mutex);
+    if (!on && !g_fg_req.builtin) return;  // the LSFG setting is not this one's to turn off
+    g_fg_req = FgRequest{};
+    g_fg_req.on = on;
+    g_fg_req.builtin = true;
     g_fg_req_pending = true;
 }
 
@@ -1932,26 +2212,50 @@ void run_main_loop() {}  // Android: the activity owns the main thread
 void with_autorelease_pool(void (*fn)()) { fn(); }
 
 // ---------------------------------------------------------------- clears
+// Clears are deferred (Image::pendingClearLayers): the render pass that next draws into the cleared
+// layer clears it as it begins (vk_draw.cpp, ensure_pass). On tiled mobile GPUs a clear recorded
+// here wrote the whole image to memory and that pass then read it back in full; a clear at the
+// pass's start costs nothing. The game clears its colour and depth targets (scene, shadow maps,
+// post-processing buffers) before drawing into them, many times per frame. WWHD_EAGER_CLEARS=1: as
+// before (each clear recorded at once).
+static bool eager_clears() {
+    static const bool e = getenv("WWHD_EAGER_CLEARS") != nullptr;
+    return e;
+}
+
 static void clear_surface(Surface* s, const float* rgba, bool clearDepth, float depth, bool clearStencil, uint32_t stencil,
                           uint32_t firstSlice = 0, uint32_t numSlices = 1) {
     if (!s || !s->img.image) return;
-    prepare(s->img, Use::COPY_DST);
-    VkCommandBuffer cmd = command_buffer();
-    uint32_t n = std::min(numSlices, s->img.layers - std::min(firstSlice, s->img.layers - 1));
+    Image& img = s->img;
+    firstSlice = std::min(firstSlice, img.layers - 1);
+    uint32_t n = std::min(numSlices, img.layers - firstSlice);
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkClearValue v{};
     if (s->isDepth) {
-        VkImageAspectFlags aspect = (clearDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
-                                    (clearStencil && s->fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
-        if (aspect) {
-            VkClearDepthStencilValue v{depth, stencil};
-            VkImageSubresourceRange range{aspect, 0, 1, firstSlice, n};
-            vkCmdClearDepthStencilImage(cmd, s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
-        }
+        aspect = (clearDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (clearStencil && s->fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        if (!aspect) return;
+        v.depthStencil = {depth, stencil};
     } else {
-        VkClearColorValue v{};
-        if (s->fmt.kind == FormatInfo::FLOAT) memcpy(v.float32, rgba, 16);
-        else for (int i = 0; i < 4; i++) v.uint32[i] = (uint32_t)rgba[i];
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, firstSlice, n};
-        vkCmdClearColorImage(cmd, s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+        if (s->fmt.kind == FormatInfo::FLOAT) memcpy(v.color.float32, rgba, 16);
+        else for (int i = 0; i < 4; i++) v.color.uint32[i] = (uint32_t)rgba[i];
+    }
+    // the clear replaces what an open pass drew there: that pass must not go on drawing into it
+    end_pass();
+    const uint32_t bits = firstSlice + n >= 32 ? 0 : ((1u << n) - 1) << firstSlice;
+    if (img.pendingClearLayers && (img.pendingClearAspect != aspect || memcmp(&img.pendingClearValue, &v, sizeof v) != 0))
+        flush_pending_clear(img);
+    if (bits && !eager_clears()) {
+        img.pendingClearLayers |= bits;
+        img.pendingClearAspect = aspect;
+        img.pendingClearValue = v;
+    } else {
+        flush_pending_clear(img);
+        prepare(img, Use::COPY_DST);
+        VkImageSubresourceRange range{aspect, 0, 1, firstSlice, n};
+        if (s->isDepth)
+            vkCmdClearDepthStencilImage(command_buffer(), img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v.depthStencil, 1, &range);
+        else
+            vkCmdClearColorImage(command_buffer(), img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v.color, 1, &range);
     }
     mark_gpu_written(s);
 }
@@ -1971,6 +2275,17 @@ void clear_depth_stencil(const uint32_t* regs, uint32_t db, float depth, uint32_
     if (log_this_frame() && s)
         LOG("[clear] depth %08X %ux%ux%u fmt %X vk %d -> depth %.4f stencil %u flags %u slices %u+%u", s->addr, s->width, s->height,
             s->slices, s->format, (int)s->fmt.format, depth, stencil, flags, first, num);
+#ifdef __ANDROID__
+    // the main depth buffer cleared a second time in a frame after being drawn into (the title draws
+    // Outset, then the boat over a cleared depth): the in-between frame keeps the first pass's depth
+    if ((flags & 1) && s && s->addr == R.mainDepthAddr && rp::enabled()) {
+        static uint64_t lastFrame = ~0ull;
+        static uint32_t lastAddr = 0;
+        if (lastFrame == R.frame && lastAddr == s->addr && !s->img.pendingClearLayers) rp::keep_depth(s);
+        lastFrame = R.frame;
+        lastAddr = s->addr;
+    }
+#endif
     clear_surface(s, nullptr, flags & 1, depth, (flags & 2) != 0, stencil, first, num);
 }
 
@@ -1978,6 +2293,21 @@ void clear_depth_stencil(const uint32_t* regs, uint32_t db, float depth, uint32_
 void copy_surface(uint32_t src, uint32_t srcMip, uint32_t srcSlice, uint32_t dst, uint32_t dstMip, uint32_t dstSlice) {
     void copy_surface_impl(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
     copy_surface_impl(src, srcMip, srcSlice, dst, dstMip, dstSlice);
+}
+
+// The GamePad picture while nothing shows it (TV-only and hybrid layouts outside the game's menus):
+// the game still draws it every frame (~130 draws, ~1 ms of GPU on an Adreno 650). Its draws go to
+// 854x480 targets (the game reuses the TV scene's memory for them, so the size is what tells them
+// apart; no TV-shaped target has it); they are left out then. WWHD_DRAW_HIDDEN_DRC=1 draws them anyway.
+// whether the GamePad picture is shown anywhere (in the window's layout or a second display)
+bool drc_shown() {
+    return __atomic_load_n(&g_drc_visible, __ATOMIC_RELAXED) || __atomic_load_n(&g_sc_drc.window, __ATOMIC_RELAXED);
+}
+
+bool skip_hidden_drc_draw(uint32_t w, uint32_t h) {
+    static const bool drawAnyway = getenv("WWHD_DRAW_HIDDEN_DRC") && atoi(getenv("WWHD_DRAW_HIDDEN_DRC")) != 0;
+    if (drawAnyway || h != 480 || (w != 854 && w != 855)) return false;
+    return !__atomic_load_n(&g_drc_visible, __ATOMIC_RELAXED) && !__atomic_load_n(&g_sc_drc.window, __ATOMIC_RELAXED);
 }
 
 void copy_to_scan(uint32_t cb, uint32_t target) {
@@ -2264,6 +2594,7 @@ static std::atomic<uint64_t> g_frames_completed{0}, g_frames_submitted{0};
 // GPU so the game can reuse the frame's buffers; this renderer has copied all guest data by the time
 // a frame is submitted, so a submitted frame counts, as long as the GPU is at most one frame behind.
 // The CPU then builds frame N+1 while the GPU renders frame N (WWHD_STRICT_FLIPS=1: wait for the GPU).
+uint64_t frames_submitted() { return g_frames_submitted.load(); }
 uint64_t frames_completed() {
     static const bool strict = getenv("WWHD_STRICT_FLIPS") != nullptr;
     uint64_t done = g_frames_completed.load();
@@ -2281,6 +2612,7 @@ std::deque<VkFence> g_fw_pending;
 std::vector<VkFence> g_fw_free;
 
 void frame_waiter_thread() {
+    platform::set_thread_name("GX2 frame wait");
     for (;;) {
         VkFence f;
         {
@@ -2387,7 +2719,7 @@ static void perf_frame() {
         g_perf[1] = (float)(sumMs / frames);
         g_perf[2] = (float)maxMs;
         g_perf[3] = (float)((p - presents0) / el);
-        g_perf[4] = fg::loaded() ? fg::gpu_ms() : 0.0f;
+        g_perf[4] = fg::loaded() ? fg::gpu_ms() : 0.0f;  // (the built-in generation: one small pass)
         if (logIt) LOG("[perf] game %.1f fps, frame %.1f ms, max %.1f, late %d", g_perf[0], g_perf[1], g_perf[2], late);
         late = 0;
         presents0 = p;
@@ -2398,6 +2730,21 @@ static void perf_frame() {
 }
 const char* driver_info() { return R.driverInfo.c_str(); }
 const char* gpu_name() { return R.device ? R.props.deviceName : ""; }
+
+// `gpu_lost` in the working directory (the app's files folder, jni_main.cpp): the GPU and the driver
+// that lost the device; MainActivity offers another GPU driver at the next start. Old Qualcomm
+// drivers (v502 on the Adreno 640/650) hang on this game (issue #25); Turnip doesn't.
+void vk_note_device_lost() {
+    static std::atomic<bool> noted{false};
+    if (noted.exchange(true)) return;
+    if (FILE* f = fopen("gpu_lost", "w")) {
+        const char* custom = getenv("WWHD_GPU_DRIVER_DIR");
+        fprintf(f, "%s\n%s\n%s\n", R.device ? R.props.deviceName : "", R.driverInfo.c_str(), custom ? custom : "");
+        fclose(f);
+    }
+    LOG("[vk] device lost (%s, %s): the next start offers another GPU driver", R.device ? R.props.deviceName : "?", R.driverInfo.c_str());
+    rec::crumbs_report();
+}
 bool driver_fallback() { return g_driver_fallback; }
 
 void perf_stats(float out[7]) {
@@ -2405,10 +2752,23 @@ void perf_stats(float out[7]) {
     memcpy(out, g_perf, sizeof g_perf);
 }
 
+void hitch_report(double frameMs, double warmMs);  // vk_draw.cpp
 void swap() {
-    cache_warm_step();
+    {
+        static auto last = std::chrono::steady_clock::now();
+        const auto t0 = std::chrono::steady_clock::now();
+        cache_warm_step();
+        evict_unused_textures();
+        trim_upload_chunks();
+        const auto t1 = std::chrono::steady_clock::now();
+        hitch_report(std::chrono::duration<double, std::milli>(t0 - last).count(), std::chrono::duration<double, std::milli>(t1 - t0).count());
+        last = t1;
+    }
     perf_frame();
-    platform::perf_hint_frame();
+    // the upstream ADPF session (platform.cpp) would compete with ours on the same threads
+    // (android/perf_hint.cpp, game + render thread work); WWHD_UPSTREAM_PERF_HINT=1 uses it too
+    static const bool upstreamHint = getenv("WWHD_UPSTREAM_PERF_HINT") != nullptr;
+    if (upstreamHint) platform::perf_hint_frame(interp::frames_per_step());
     prof_frame();
     latch_resolution_scale();
     apply_frame_generation();
@@ -2432,7 +2792,7 @@ void swap() {
         pendingCapture.clear();
     }
     if (const char* dir = capture_begin_frame()) pendingCapture = dir;
-    if (!(fg::loaded() ? present_frame_fg() : present_frame())) submit();
+    if (!(gen_on() ? present_frame_fg() : present_frame())) submit();
     present_drc_window();
     signal_frame_end();
     g_frames_submitted++;
@@ -2448,6 +2808,26 @@ void swap() {
     }
     // keep the driver's compiled pipelines across launches (the app can be killed at any time)
     static size_t savedPipelines = 0;
+    if (R.frame % 1800 == 0) {  // once a minute at 30 fps: the trend shows in the log a crash log carries
+        char pn[200];
+        platform::process_numbers(pn, sizeof pn);
+        LOG("[proc] %s", pn);
+        // the renderer's images (textures, render targets): they're kept for the whole session
+        size_t n = 0, bytes = 0, targets = 0;
+        for (auto& [addr, surf] : R.surfaces) {
+            n++;
+            if (surf->gpuWritten) targets++;
+            if (surf->img.alloc) {
+                VmaAllocationInfo ai{};
+                vmaGetAllocationInfo(R.vma, surf->img.alloc, &ai);
+                bytes += ai.size;
+            }
+        }
+        VmaTotalStatistics vs{};
+        vmaCalculateStatistics(R.vma, &vs);
+        LOG("[gfx] memory: %zu surfaces (%zu rendered to), %.0f MB in their images; all Vulkan memory %.0f MB in %u blocks",
+            n, targets, bytes / 1048576.0, vs.total.statistics.blockBytes / 1048576.0, vs.total.statistics.blockCount);
+    }
     if (R.frame % 1800 == 0 && pipelines_created() != savedPipelines) {
         savedPipelines = pipelines_created();
         save_caches();

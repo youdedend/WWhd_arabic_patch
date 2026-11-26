@@ -1,6 +1,10 @@
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <tuple>
+#include <unistd.h>
+#include <unordered_set>
 // Guest surfaces <-> Vulkan images: render targets, depth buffers, sampled textures. Same rules as
 // the Metal renderer (gfx/metal_surfaces.mm); tiled layouts are decoded with the vendored LatteAddrLib.
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
@@ -8,6 +12,7 @@
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "gx2/gx2.h"
 #include "gx2_texture_regs.h"
+#include "mem_writes.h"
 #include "runtime.h"
 #include "vk.h"
 
@@ -24,6 +29,9 @@ static uint64_t fnv(const uint8_t* p, size_t n) {
 }
 
 static uint64_t g_write_seq = 0;
+static std::vector<Surface*> g_linear_targets;  // linear-aligned colour render targets (never freed: see evict_unused_textures)
+static uint64_t g_surfaces_epoch;  // bumped when surfaces are freed (lookups that kept a Surface* check it)
+static Surface* adopt_newer_alias(Surface* s);
 uint64_t next_write_seq() { return ++g_write_seq; }
 uint64_t write_seq() { return g_write_seq; }
 
@@ -60,8 +68,7 @@ static void image_shape(uint32_t dim, uint32_t slices, bool forRendering, VkImag
 
 // Rendering at a higher (or lower) resolution than the console: render targets with the screen's
 // 16:9 shape (the TV image and its post-processing chain, the GamePad image) are created this much
-// larger. Shadow maps and other square or array targets keep their size (WWHD_SHADOW_SCALE=n scales
-// the shadow maps). Shaders still see guest
+// larger. Shadow maps and other square or array targets keep their size. Shaders still see guest
 // units: viewports and scissors are scaled, and uf_fragCoordScale / uf_texNScale undo the scale.
 // The factor can change while the game runs (app setting): it is requested from any thread and
 // latched at the frame boundary; render targets made at another factor are reallocated when they
@@ -125,38 +132,59 @@ static void target_aspect(const Surface* s, float& ax, float& ay) {
     target_aspect_factors(s->width, s->height, ax, ay);
 }
 
-// ---------------------------------------------------------------- scaled copies without blits (upstream #72)
-// Vulkan makes depth/stencil blits optional, and some Adreno drivers have none (D16/D32 on the
-// Adreno 830, where an aspect-ratio or resolution change crashed the game). Upstream draws such
-// copies; this renderer has no temporary render-pass infrastructure at the copy sites, so an
-// unblittable scaled copy clears its destination instead (depth 1, stencil/colour 0): deterministic,
-// and the game re-renders depth every frame. Same-size copies use vkCmdCopyImage (exact). The first
-// format that takes the clear path logs one line. WWHD_VK_DEPTH_COPY=none forces the clear path
-// for depth (test aid).
-static bool depth_copy_none() {
-    static const bool v = [] {
-        const char* e = getenv("WWHD_VK_DEPTH_COPY");
-        return e && !strcmp(e, "none");
-    }();
-    return v;
+// The factor a screen-shaped render target gets (ZeldaWWHDRecomp's Android work). The game's
+// post-processing buffers (960x540 and its reductions: 270, 135, 67/68, 33/34, 16/17 lines) hold
+// blurred, low-frequency pictures. On phones the bloom chain is drawn at half its size
+// (WWHD_BLOOM_SCALE, 0.25-1; 1 = as before), and above 1x the post buffers stay at the console's
+// size: the game's blurs on an upscaled buffer sample a whole guest texel per tap (area_sample.h),
+// which cost ~2 ms each at 1.5x on an Adreno 650. The 640x360 family (screen-space shadow mask,
+// depth copies) follows the scene: a smaller shadow mask bleeds shadow across characters' edges.
+static float env_scale(const char* name, float def, float lo, float hi) {
+    const char* e = getenv(name);
+    return e && *e ? std::clamp((float)atof(e), lo, hi) : def;
 }
-static bool format_can_blit(VkFormat format) {
-    VkFormatProperties fp;
-    vkGetPhysicalDeviceFormatProperties(R.pd, format, &fp);
-    auto f = fp.optimalTilingFeatures;
-    return (f & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (f & VK_FORMAT_FEATURE_BLIT_DST_BIT);
-}
-static void log_cleared_copy(VkFormat format, const char* what) {
-    static std::vector<VkFormat> logged;  // render thread only, like the call sites
-    if (std::find(logged.begin(), logged.end(), format) == logged.end()) {
-        logged.push_back(format);
-        LOG("[gfx] Vulkan: format %d cannot be blitted on this device; %s are cleared instead", int(format), what);
+// format bit of a post-processing buffer: 1 R11G11B10F, 2 RGB10A2, 4 RGBA8, 8 RGBA16F (0: none)
+static int post_format_bit(const Surface* s) {
+    const uint32_t h = s->height;
+    if (s->sceneScale || s->fmt.depth || s->fmt.compressed || !(h == 540 || h == 270 || h == 135 || (h >= 16 && h <= 68))) return 0;
+    switch (s->fmt.format) {
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 1;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+    default: return 0;
     }
+}
+static float target_scale(const Surface* s) {
+    // which formats: WWHD_BLOOM_FORMATS (half size; default only the bloom chain proper, R11G11B10F:
+    // the RGB10A2 960x540 copy feeds the heat haze / depth of field, whose edges went blocky at half
+    // size) and WWHD_POST_FORMATS (kept at the console's size above 1x; default all of them)
+    static const float bloom = env_scale("WWHD_BLOOM_SCALE", 0.5f, 0.25f, 1.0f);
+    static const int bloomFormats = getenv("WWHD_BLOOM_FORMATS") ? atoi(getenv("WWHD_BLOOM_FORMATS")) : 1;
+    static const int postFormats = getenv("WWHD_POST_FORMATS") ? atoi(getenv("WWHD_POST_FORMATS")) : 0xF;
+    const float r = resolution_scale();
+    const int bit = post_format_bit(s);
+    if (!bit) return r;
+    if (bloom < 1.0f && (bloomFormats & bit)) return std::min(r, 1.0f) * bloom;
+    return (postFormats & bit) ? std::min(r, 1.0f) : r;
+}
+
+// The game's shadow map, a square depth array of its 3 cascades (1024x1024 D16 on the TV): its own
+// scale for tests (WWHD_SHADOW_SCALE, applied as the game creates it). Its passes are bound by their
+// draws (3 x ~380 casters), not their pixels: on an Adreno 650 half size saved 0.16 ms of a 20 ms
+// frame for blockier shadow edges, so it is no setting. Draws into it scale their viewport and
+// scissor by the image's own size (vk_draw.cpp), and the game samples it with normalized coordinates.
+static bool shadow_map(const Surface* s) {
+    return s->isDepth && s->slices == 3 && s->width == s->height && s->width >= 512;
+}
+static float shadow_scale() {
+    static const float v = env_scale("WWHD_SHADOW_SCALE", 1.0f, 0.25f, 1.0f);
+    return v;
 }
 
 Surface* rescaled(Surface* s) {
     if (!s || !s->img.image || s->img.type != VK_IMAGE_TYPE_2D || s->mips > 1 || !screen_shaped(s)) return s;
-    float want = resolution_scale(), ax, ay;
+    float want = target_scale(s), ax, ay;
     target_aspect(s, ax, ay);
     if (std::fabs(s->rscale - want) < 1e-3f && s->ax == ax && s->ay == ay) return s;
     Image old = s->img;
@@ -174,7 +202,7 @@ Surface* rescaled(Surface* s) {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(R.pd, s->img.format, &fp);
     VkFormatFeatureFlags f = fp.optimalTilingFeatures;
-    if ((f & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (f & VK_FORMAT_FEATURE_BLIT_DST_BIT) && !(s->fmt.depth && depth_copy_none())) {
+    if ((f & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (f & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
         bool linear = !s->fmt.depth && (f & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
         prepare(old, Use::COPY_SRC);
         prepare(s->img, Use::COPY_DST);
@@ -185,21 +213,6 @@ Surface* rescaled(Surface* s) {
         b.dstOffsets[1] = {(int32_t)s->img.width, (int32_t)s->img.height, 1};
         vkCmdBlitImage(command_buffer(), old.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->img.image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-    } else {
-        // the GPU can't blit this format (depth on some Adreno drivers, upstream #72): clear the
-        // new image instead of leaving it undefined (depth 1, stencil/color 0)
-        log_cleared_copy(s->img.format, "rescaled surfaces");
-        prepare(s->img, Use::COPY_DST);
-        if (s->isDepth) {
-            VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT | (s->fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
-            VkClearDepthStencilValue v{1.0f, 0};
-            VkImageSubresourceRange range{aspect, 0, 1, 0, 1};
-            vkCmdClearDepthStencilImage(command_buffer(), s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
-        } else {
-            VkClearColorValue v{};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(command_buffer(), s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
-        }
     }
     retire_image(old);
     if (Surface* c = s->feedbackCopy) {  // recreated at the new size when next needed
@@ -211,6 +224,11 @@ Surface* rescaled(Surface* s) {
         retire_image(c->img);
         delete c;
         s->mipChain = nullptr;
+    }
+    if (Surface* c = s->volume) {
+        retire_image(c->img);
+        delete c;
+        s->volume = nullptr;
     }
     static int logged = 0;
     if (getenv("WWHD_LOG_RESCALE") || logged++ < 3)
@@ -231,19 +249,17 @@ bool create_surface_image(Surface* s, bool forRendering) {
     s->rscale = 1.0f;
     s->ax = s->ay = 1.0f;
     if (forRendering && type == VK_IMAGE_TYPE_2D && screen_shaped(s)) target_aspect(s, s->ax, s->ay);
-    if (forRendering && type == VK_IMAGE_TYPE_2D && (resolution_scale() != 1.0f || s->ax != 1.0f || s->ay != 1.0f) && screen_shaped(s)) {
-        s->rscale = resolution_scale();
+    if (forRendering && type == VK_IMAGE_TYPE_2D && screen_shaped(s) && (target_scale(s) != 1.0f || s->ax != 1.0f || s->ay != 1.0f)) {
+        s->rscale = target_scale(s);
         w = std::max<uint32_t>(1, (uint32_t)lroundf(s->width * s->rscale * s->ax));
         h = std::max<uint32_t>(1, (uint32_t)lroundf(s->height * s->rscale * s->ay));
-    }
-    // shadow maps (depth arrays: the game's cascades) keep the console's 1024x1024, the soft steady
-    // edges of upstream's WWHD_SHADOW_FIX=1 (issue #67); WWHD_SHADOW_SCALE=n scales them instead
-    // (sharper edges that can shimmer, as upstream's default; restart to apply)
-    static const float shadow = getenv("WWHD_SHADOW_SCALE") ? clamp_scale((float)atof(getenv("WWHD_SHADOW_SCALE"))) : 0.0f;
-    if (shadow && forRendering && type == VK_IMAGE_TYPE_2D && s->fmt.depth && !s->fmt.compressed && s->mips == 1 && s->slices > 1) {
-        s->rscale = shadow;
-        w = std::max<uint32_t>(1, (uint32_t)lroundf(s->width * shadow));
-        h = std::max<uint32_t>(1, (uint32_t)lroundf(s->height * shadow));
+    } else if (forRendering && type == VK_IMAGE_TYPE_2D && shadow_map(s) && shadow_scale() < 1.0f) {
+        s->rscale = shadow_scale();
+        w = std::max<uint32_t>(1, (uint32_t)lroundf(s->width * s->rscale));
+        h = std::max<uint32_t>(1, (uint32_t)lroundf(s->height * s->rscale));
+        static bool logged = false;
+        if (!logged) LOG("[gfx] shadow map %ux%u drawn at %ux%u", s->width, s->height, w, h);
+        logged = true;
     }
     // a mip chain can't be longer than the size allows
     uint32_t maxMips = 1;
@@ -270,6 +286,10 @@ Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
         if (!forRendering && s->isDepth && !d.isDepth && s->gpuWritten && s->width == d.width && s->height == d.height)
             consider(s);
         if (s->isDepth != d.isDepth) continue;
+        // a render target is one level: don't adopt a texture made first by sampling the address with
+        // a mip chain (rendering would define level 0 only, and mip-filtered reads would see the
+        // never-rendered levels: black shadows for the session; original project efc9f66, issue #47)
+        if (forRendering && s->mips > 1) continue;
         if (s->width == d.width && s->height == d.height && s->format == d.format && s->slices == d.slices &&
             (forRendering || s->mips >= d.mips || s->gpuWritten)) {
             if (forRendering) return s;
@@ -279,7 +299,8 @@ Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
         // render target being sampled with a compatible format but different view parameters
         if (!forRendering && s->gpuWritten && (s->format & 0x3F) == (d.format & 0x3F)) consider(s);
     }
-    if (exact && (exact->gpuWritten || !rendered || exact->writeSeq > rendered->writeSeq)) return exact;
+    if (exact && (exact->gpuWritten || !rendered || exact->writeSeq > rendered->writeSeq))
+        return exact->gpuWritten ? adopt_newer_alias(exact) : exact;
     if (rendered) return rendered;
     if (exact) return exact;
 
@@ -307,9 +328,52 @@ Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering) {
         LOG("[surface] %s %08X %ux%u x%u format %X tile %u", s->isDepth ? "depth" : "color", s->addr, s->width, s->height,
             s->slices, s->format, s->tileMode);
     Surface* raw = s.get();
+    // another format view of the same texel bits at this address (adopt_newer_alias)
+    if (!raw->isDepth)
+        for (auto it = range.first; it != range.second; ++it)
+            if (!it->second->isDepth && (it->second->format & 0x3F) == (raw->format & 0x3F)) raw->aliased = it->second->aliased = true;
     R.surfaces.emplace(d.addr, std::move(s));
+    if (forRendering && !raw->isDepth && raw->tileMode == (uint32_t)Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED) g_linear_targets.push_back(raw);
     surfaces_changed();
     return raw;
+}
+
+// One guest surface can be drawn and sampled through views of different formats with the same texel
+// bits, such as RGBA8 and RGBA8 sRGB: the Picto Box draws its picture through the sRGB view and then
+// through the plain one (issue #22; as upstream's fix for its issue #53). Each format has its own
+// image here, so before one is used, it takes over the texels of a more recent compatible one (a raw
+// copy, as the memory is shared).
+static Surface* adopt_newer_alias(Surface* s) {
+    if (!s || !s->aliased || !s->img.image || s->isDepth || s->fmt.compressed || s->fmt.convert != Convert::NONE) return s;
+    Surface* newest = nullptr;
+    auto range = R.surfaces.equal_range(s->addr);
+    for (auto it = range.first; it != range.second; ++it) {
+        Surface* o = it->second.get();
+        if (o == s || !o->gpuWritten || !o->img.image || o->isDepth || o->fmt.compressed || o->fmt.convert != Convert::NONE) continue;
+        if (s->gpuWritten && o->writeSeq <= s->writeSeq) continue;
+        if ((o->format & 0x3F) != (s->format & 0x3F) || o->fmt.hostBytesPerBlock != s->fmt.hostBytesPerBlock) continue;
+        if (o->img.type != s->img.type || o->img.layers != s->img.layers || o->img.width != s->img.width ||
+            o->img.height != s->img.height || o->img.depth != s->img.depth)
+            continue;
+        if (!newest || o->writeSeq > newest->writeSeq) newest = o;
+    }
+    if (!newest) return s;
+    prepare(newest->img, Use::COPY_SRC);
+    prepare(s->img, Use::COPY_DST);
+    VkImageCopy regions[16];
+    uint32_t n = std::min({s->img.mips, newest->img.mips, 16u});
+    for (uint32_t m = 0; m < n; m++) {
+        regions[m] = {};
+        regions[m].srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, s->img.layers};
+        regions[m].dstSubresource = regions[m].srcSubresource;
+        regions[m].extent = {std::max(s->img.width >> m, 1u), std::max(s->img.height >> m, 1u), std::max(s->img.depth >> m, 1u)};
+    }
+    vkCmdCopyImage(command_buffer(), newest->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->img.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regions);
+    mark_gpu_written(s);
+    static int logged = 0;
+    if (logged++ < 8) LOG("[gfx] %08X: format %X view takes the texels of format %X", s->addr, s->format, newest->format);
+    return s;
 }
 
 // ---------------------------------------------------------------- render targets
@@ -336,7 +400,7 @@ Surface* color_target(const uint32_t* regs, int i, uint32_t* slice) {
     d.tileMode = (info >> 8) & 0xF;
     d.slices = slices;
     d.dim = slices > 1 ? kDim2DArray : kDim2D;
-    return rescaled(find_or_create_surface(d, true));
+    return adopt_newer_alias(rescaled(find_or_create_surface(d, true)));
 }
 
 Surface* depth_target(const uint32_t* regs, uint32_t* slice) {
@@ -364,7 +428,8 @@ Surface* depth_target(const uint32_t* regs, uint32_t* slice) {
 Surface* surface_from_color_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t* numSlices) {
     auto* cb = (GX2::GX2ColorBuffer*)mem::ptr(addr);
     SurfaceDesc d;
-    uint32_t slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32_t>(cb->surface.depth, 1) : 1;
+    auto dim = cb->surface.dim.value();
+    uint32_t slices = dim == Latte::E_DIM::DIM_2D_ARRAY || dim == Latte::E_DIM::DIM_3D ? std::max<uint32_t>(cb->surface.depth, 1) : 1;
     d.slices = slices;
     d.dim = slices > 1 ? kDim2DArray : kDim2D;
     if (firstSlice) *firstSlice = std::min<uint32_t>(cb->viewFirstSlice, slices - 1);
@@ -541,6 +606,54 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
     return c;
 }
 
+// A render target sampled as a 3D texture: the game renders the volume slice by slice (each slice a
+// layer of the 2D array render target; the Picto Box's colour grading after a shot), then samples it
+// as a 3D texture, which a 2D image can't be viewed as. A companion 3D image gets the layers as its
+// slices, copied again whenever the target was drawn to since.
+static Surface* with_volume(Surface* s, const SurfaceDesc& d) {
+    if (d.dim != (uint32_t)Latte::E_DIM::DIM_3D || !s || s->img.type != VK_IMAGE_TYPE_2D || s->img.layers < 1 || s->fmt.depth ||
+        !s->img.image)
+        return s;
+    const uint32_t w = s->img.width, h = s->img.height, n = s->img.layers;
+    Surface* c = s->volume;
+    if (c && (c->img.width != w || c->img.height != h || c->img.depth != n || c->img.format != s->img.format)) {
+        retire_image(c->img);
+        delete c;
+        c = s->volume = nullptr;
+    }
+    if (!c) {
+        c = new Surface();
+        c->width = s->width;
+        c->height = s->height;
+        c->slices = n;
+        c->mips = 1;
+        c->format = s->format;
+        c->dim = d.dim;
+        c->fmt = s->fmt;
+        c->gpuWritten = true;
+        if (!create_image(c->img, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D, s->img.format, w, h, n, 1, 1,
+                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false, false, false)) {
+            delete c;
+            return s;
+        }
+        s->volume = c;
+        s->volumeSeq = ~0ull;
+        LOG("[gfx] 3D texture %08X %ux%ux%u from its rendered slices", s->addr, w, h, n);
+    }
+    if (s->volumeSeq == s->writeSeq) return c;
+    s->volumeSeq = s->writeSeq;
+    prepare(s->img, Use::COPY_SRC);
+    prepare(c->img, Use::COPY_DST);
+    // layers of a 2D array -> slices of a 3D image (Vulkan 1.1: layer count = extent depth)
+    VkImageCopy cp{};
+    cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n};
+    cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.extent = {w, h, n};
+    vkCmdCopyImage(command_buffer(), s->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->img.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    return c;
+}
+
 // The surface a set of texture words resolves to only changes when a surface is created or written
 // (the choice among surfaces aliasing one address depends on that): remember recent lookups.
 static Surface* check_texture(Surface* s);
@@ -550,6 +663,7 @@ struct TexLookup {
     SurfaceDesc d;  // what the words describe (the mip chain is applied on every hit)
     uint64_t writeSeq;
     size_t surfaces;
+    uint64_t epoch;
     Surface* s;
     bool used;
 };
@@ -559,9 +673,11 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     uint64_t key = 0x9E3779B97F4A7C15ull;
     for (int i = 0; i < 7; i++) key = (key ^ w[i]) * 0xFF51AFD7ED558CCDull;
     TexLookup& tl = g_tex_lookups[(key ^ (key >> 29)) & 511];
-    if (tl.used && tl.writeSeq == g_write_seq && tl.surfaces == R.surfaces.size() && tl.depthSampler == isDepthSampler &&
+    if (tl.used && tl.writeSeq == g_write_seq && tl.surfaces == R.surfaces.size() && tl.epoch == g_surfaces_epoch &&
+        tl.depthSampler == isDepthSampler &&
         memcmp(tl.w, w, sizeof tl.w) == 0) {
         Surface* s = check_texture(tl.s);
+        if (s && s->gpuWritten && tl.d.dim == (uint32_t)Latte::E_DIM::DIM_3D) return with_volume(s, tl.d);
         if (s && s->gpuWritten && tl.d.mips > 1 && !isDepthSampler) return with_mip_chain(s, tl.d);
         return s;
     }
@@ -607,11 +723,10 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     d.dim = (uint32_t)dim;
     d.tileMode = (uint32_t)tileMode;
     d.swizzle = swizzle;
-    // A depth-compare (shadow) sampler looks for the depth surfaces at this address, as the original
-    // project's renderer does: a GPU-written colour image aliasing the shadow map's memory must not
-    // win over the cascade (the shadows alternated between two states).
-    static const bool colorLookup = getenv("WWHD_SHADOW_COLOR_LOOKUP") != nullptr;  // debug: as before
-    d.isDepth = isDepthSampler && !colorLookup;
+    // A depth-compare (shadow) sampler looks for the depth surfaces at this address, like the
+    // official renderer. Looking up a colour surface let a GPU-written colour image aliasing the
+    // shadow map's memory win over the cascade, so the shadows alternated between two states.
+    d.isDepth = isDepthSampler;
     Surface* s = find_or_create_surface(d, false);
     s = check_texture(s);
     memcpy(tl.w, w, sizeof tl.w);
@@ -619,26 +734,132 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     tl.d = d;
     tl.writeSeq = g_write_seq;  // after the check: an upload counts as a write
     tl.surfaces = R.surfaces.size();
+    tl.epoch = g_surfaces_epoch;
     tl.s = s;
     tl.used = true;
+    if (s && s->gpuWritten && d.dim == (uint32_t)Latte::E_DIM::DIM_3D) return with_volume(s, d);
     if (s && s->gpuWritten && d.mips > 1 && !d.isDepth) return with_mip_chain(s, d);
     return s;
 }
 
+// Textures uploaded from guest memory are freed when the game hasn't sampled them for a while:
+// surfaces were never freed, and every area visited left its textures in GPU memory (Adreno has no
+// BC formats: RGBA8 with mips, ~100 MB per area; 1.3 -> 2.4 GB in a few minutes of changing areas on
+// a Galaxy S20 FE, until Android ended the game for low memory). Every 300 frames: those unused for
+// two minutes (WWHD_TEXTURE_IDLE_FRAMES, 0 = keep all), then, while the textures take more than a
+// tenth of the device's memory (at least 384 MB; WWHD_TEXTURE_BUDGET_MB), the least recently used
+// that weren't sampled in the last 300 frames. A texture sampled again is made again from guest
+// memory (its contents are the guest's); render targets, depth buffers and textures the GPU wrote
+// stay (their contents exist only on the GPU).
+// debug: WWHD_MEM_LOG=1 logs GPU memory by kind every 600 frames
+static void mem_log() {
+    static const bool on = getenv("WWHD_MEM_LOG") != nullptr;
+    if (!on || R.frame % 600) return;
+    uint64_t n[3] = {}, b[3] = {};  // CPU textures, GPU-written colour, depth
+    for (auto& [a, sp] : R.surfaces) {
+        const Surface* s = sp.get();
+        int k = s->isDepth ? 2 : s->gpuWritten ? 1 : 0;
+        n[k]++;
+        if (s->img.alloc) {
+            VmaAllocationInfo ai;
+            vmaGetAllocationInfo(R.vma, s->img.alloc, &ai);
+            b[k] += ai.size;
+        }
+    }
+    VmaTotalStatistics st;
+    vmaCalculateStatistics(R.vma, &st);
+    LOG("[mem] textures %llu (%llu MB), gpu colour %llu (%llu MB), depth %llu (%llu MB); vma blocks %llu MB in %u, allocations %llu MB in %u",
+        (unsigned long long)n[0], (unsigned long long)(b[0] >> 20), (unsigned long long)n[1], (unsigned long long)(b[1] >> 20),
+        (unsigned long long)n[2], (unsigned long long)(b[2] >> 20), (unsigned long long)(st.total.statistics.blockBytes >> 20),
+        st.total.statistics.blockCount, (unsigned long long)(st.total.statistics.allocationBytes >> 20), st.total.statistics.allocationCount);
+}
+
+static uint64_t texture_budget() {
+    if (const char* e = getenv("WWHD_TEXTURE_BUDGET_MB")) return strtoull(e, nullptr, 10) << 20;
+    const uint64_t ram = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
+    return std::max<uint64_t>(ram / 10, 384ull << 20);
+}
+
+void evict_unused_textures() {
+    mem_log();
+    static const uint64_t idle = getenv("WWHD_TEXTURE_IDLE_FRAMES") ? strtoull(getenv("WWHD_TEXTURE_IDLE_FRAMES"), nullptr, 10) : 7200;
+    static const uint64_t budget = texture_budget();
+    if (!idle || R.frame % 300) return;
+    auto bytes_of = [](const Surface* s) -> uint64_t {
+        if (!s->img.alloc) return 0;
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(R.vma, s->img.alloc, &ai);
+        return ai.size;
+    };
+    auto evictable = [](const Surface* s) {
+        return !s->gpuWritten && !s->isDepth && !s->aliased && !s->feedbackCopy && !s->mipChain && !s->volume &&
+               s->lastCheckedFrame != ~0ull;
+    };
+    std::vector<std::pair<uint64_t, Surface*>> lru;  // last sampled frame, texture
+    uint64_t total = 0;
+    for (auto& [a, sp] : R.surfaces)
+        if (evictable(sp.get())) {
+            total += bytes_of(sp.get());
+            lru.push_back({sp->lastCheckedFrame, sp.get()});
+        }
+    std::sort(lru.begin(), lru.end(), [](auto& x, auto& y) { return x.first < y.first; });
+    std::unordered_set<const Surface*> drop;
+    uint64_t freed = 0;
+    for (auto& [last, s] : lru) {
+        const uint64_t age = R.frame - last;
+        if (age <= 300 || (age <= idle && total - freed <= budget)) break;
+        drop.insert(s);
+        freed += bytes_of(s);
+    }
+    if (drop.empty()) return;
+    std::vector<Image> imgs;
+    for (auto it = R.surfaces.begin(); it != R.surfaces.end();) {
+        if (!drop.count(it->second.get())) {
+            ++it;
+            continue;
+        }
+        if (it->second->img.image) imgs.push_back(it->second->img);
+        it = R.surfaces.erase(it);
+    }
+    retire_images(imgs);
+    g_surfaces_epoch++;
+    surfaces_changed();
+    LOG("[gfx] freed %zu unused textures (%llu MB; %llu MB of textures left, budget %llu MB)", imgs.size(),
+        (unsigned long long)(freed >> 20), (unsigned long long)((total - freed) >> 20), (unsigned long long)(budget >> 20));
+}
+
 // a sampled CPU texture: upload it if its memory changed (checked once per frame)
+// The sparse sample (256 words spread over the texture, nearly all cache misses: ~5% of the render
+// thread at 60 fps) is skipped while the game hasn't written the texture's pages since the last
+// comparison (mem_writes.h, as vertex buffers); still taken on one frame in 16 (spread by address),
+// counting what the tracking missed, and after our own writes (lastCheckedFrame ~0: copies, readbacks).
+static const bool g_track_texture_writes = [] { const char* e = getenv("WWHD_TRACK_WRITES"); return !e || atoi(e) != 0; }();
+uint64_t g_stat_texture_stale;
 static Surface* check_texture(Surface* s) {
     if (s && !s->gpuWritten && s->lastCheckedFrame != R.frame) {
+        const bool forced = s->lastCheckedFrame == ~0ull;
         s->lastCheckedFrame = R.frame;
         // full hash only when new, invalidated, every 64 frames, or when a sparse sample changed
         bool full = s->dirty || !s->dataSize || ((R.frame + (s->addr >> 12)) & 63) == 0;
         if (!full) {
+            const bool verify = forced || ((R.frame + (s->addr >> 12)) & 15) == 0;
+            const bool tracked = g_track_texture_writes && memw::unchanged_since(s->addr, s->dataSize, s->checkGen);
+            if (tracked && !verify) return s;
+            const uint32_t gen = memw::now();  // before reading
             uint64_t h = sparse_hash(s);
-            if (h != s->sparseHash) full = true;
+            if (h != s->sparseHash) {
+                full = true;
+                if (tracked && !forced) g_stat_texture_stale++;
+            } else {
+                s->checkGen = gen;
+            }
         }
         if (full) {
             g_stat_full_checks++;
+            const uint32_t gen = memw::now();
             upload_surface(s);
             s->sparseHash = sparse_hash(s);
+            s->checkGen = gen;
             s->dirty = false;
         }
     }
@@ -648,99 +869,100 @@ static Surface* check_texture(Surface* s) {
 // ---------------------------------------------------------------- BC decoding on the GPU
 // Where the GPU can't sample BC textures (most Mali and PowerVR GPUs), a compute shader unpacks
 // them to RGBA8 / R8 / RG8 instead of the CPU. Bit-exact with convert_row() in vk_formats.cpp.
-// One invocation per 4x4 block; input = the detiled blocks, output = rows of texels as the copy
-// to the image expects them. WWHD_BC_DECODE=cpu keeps the CPU decoder (for comparisons).
+// One invocation per 4x4 block on a 3D dispatch (x, y: block column and row, z: slice); input = the
+// detiled blocks, output = rows of texels as the copy to the image expects them. WWHD_BC_DECODE=cpu
+// keeps the CPU decoder (for comparisons; Huawei GPUs use it anyway, see bc_decoder()).
+// Written for fragile mobile shader compilers (as the original project's d17240e7): each block word
+// is loaded once into a local, every selector and endpoint is cut out of a known word with a bounded
+// shift, there are no local arrays (nothing indexed dynamically), no module-scope mutable state, no
+// signed division (signed BC4/BC5 divide magnitudes), no division by a non-constant and no
+// splitting of a 1D index into a 2D group grid.
 static const char* kBcDecodeGlsl = R"(#version 450
-layout(local_size_x = 64) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(std430, binding = 0) readonly buffer Src { uint src[]; };
 layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
-layout(push_constant) uniform PC { uint mode, bw, bh, blocks; } pc;
+layout(push_constant) uniform PC { uint mode, bw, bh, slices; } pc;
 
-uint ex5(uint v) { return (v << 3) | (v >> 2); }
-uint ex6(uint v) { return (v << 2) | (v >> 4); }
-uint ex4(uint v) { return (v << 4) | v; }
-int tdiv(int n, int d) { return n < 0 ? -((-n) / d) : n / d; }  // C division (truncates)
-
-// BC4 block in words lo/hi -> 16 bytes (signed values as two's complement bytes)
-void bc4(uint lo, uint hi, bool sgn, out uint v[16]) {
-    int a0 = int(lo & 0xFFu), a1 = int((lo >> 8) & 0xFFu);
-    if (sgn) {
-        a0 = (a0 << 24) >> 24; a1 = (a1 << 24) >> 24;
-        if (a0 == -128) a0 = -127;
-        if (a1 == -128) a1 = -127;
-    }
-    int p[8];
-    p[0] = a0; p[1] = a1;
-    if (a0 > a1) {
-        for (int i = 1; i < 7; i++) p[i + 1] = tdiv((7 - i) * a0 + i * a1 + 3, 7);
-    } else {
-        for (int i = 1; i < 5; i++) p[i + 1] = tdiv((5 - i) * a0 + i * a1 + 2, 5);
-        p[6] = sgn ? -127 : 0;
-        p[7] = sgn ? 127 : 255;
-    }
-    uint il = (lo >> 16) | (hi << 16), ih = hi >> 16;  // 48 index bits
-    for (int i = 0; i < 16; i++) {
-        int b = 3 * i;
-        uint x = b < 32 ? ((il >> b) | (b > 0 ? ih << (32 - b) : 0u)) : (ih >> (b - 32));
-        v[i] = uint(p[x & 7u]) & 0xFFu;
-    }
+// 3-bit selector of texel t (0..15) of a BC4 channel block in words lo, hi: 48 index bits from bit 16
+uint selector3(uint lo, uint hi, uint t) {
+    uint bit = 16u + t * 3u;
+    if (bit >= 32u) return (hi >> (bit - 32u)) & 7u;
+    uint v = lo >> bit;
+    if (bit > 29u) v |= hi << (32u - bit);
+    return v & 7u;
 }
-
-// BC1 color block -> 16 RGBA8 words
-void bc1(uint w0, uint w1, bool punch, out uint px[16]) {
-    uint c0 = w0 & 0xFFFFu, c1 = w0 >> 16;
-    uvec4 p[4];
-    p[0] = uvec4(ex5((c0 >> 11) & 31u), ex6((c0 >> 5) & 63u), ex5(c0 & 31u), 255u);
-    p[1] = uvec4(ex5((c1 >> 11) & 31u), ex6((c1 >> 5) & 63u), ex5(c1 & 31u), 255u);
-    if (c0 > c1 || !punch) {
-        p[2] = uvec4((2u * p[0].rgb + p[1].rgb + 1u) / 3u, 255u);
-        p[3] = uvec4((p[0].rgb + 2u * p[1].rgb + 1u) / 3u, 255u);
-    } else {
-        p[2] = uvec4((p[0].rgb + p[1].rgb) / 2u, 255u);
-        p[3] = uvec4(0u);
-    }
-    uint q[4];
-    for (int i = 0; i < 4; i++) q[i] = p[i].r | (p[i].g << 8) | (p[i].b << 16) | (p[i].a << 24);
-    for (int i = 0; i < 16; i++) px[i] = q[(w1 >> (2 * i)) & 3u];
+// signed endpoint byte: -128 counts as -127
+int signed_endpoint(uint b) { int v = int(b); if (v >= 128) v -= 256; return max(v, -127); }
+// C division (truncates toward zero) by a constant, on magnitudes
+int divide(int v, uint d) { return v < 0 ? -int(uint(-v) / d) : int(uint(v) / d); }
+// BC4 texel t of the channel block lo, hi as a byte (signed values as two's complement)
+uint channel(uint lo, uint hi, uint t, bool sgn) {
+    int a = sgn ? signed_endpoint(lo & 255u) : int(lo & 255u);
+    int b = sgn ? signed_endpoint((lo >> 8u) & 255u) : int((lo >> 8u) & 255u);
+    uint i = selector3(lo, hi, t);
+    int s = int(i), v;
+    if (i == 0u) v = a;
+    else if (i == 1u) v = b;
+    else if (a > b) v = divide((8 - s) * a + (s - 1) * b + 3, 7u);
+    else if (i < 6u) v = divide((6 - s) * a + (s - 1) * b + 2, 5u);
+    else if (i == 6u) v = sgn ? -127 : 0;
+    else v = sgn ? 127 : 255;
+    return uint(v) & 255u;
+}
+uvec3 rgb565(uint c) {
+    uint r = (c >> 11u) & 31u, g = (c >> 5u) & 63u, b = c & 31u;
+    return uvec3((r << 3u) | (r >> 2u), (g << 2u) | (g >> 4u), (b << 3u) | (b >> 2u));
+}
+// BC1 palette entry i of endpoints a, b as an RGBA8 word (four: the 4-colour mode)
+uint color(uvec3 a, uvec3 b, bool four, uint i) {
+    uvec3 c;
+    uint al = 255u;
+    if (i == 0u) c = a;
+    else if (i == 1u) c = b;
+    else if (four) c = i == 2u ? (2u * a + b + 1u) / 3u : (a + 2u * b + 1u) / 3u;
+    else if (i == 2u) c = (a + b) / 2u;
+    else { c = uvec3(0u); al = 0u; }
+    return c.r | (c.g << 8u) | (c.b << 16u) | (al << 24u);
 }
 
 void main() {
-    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
-    if (id >= pc.blocks) return;
-    uint x = id % pc.bw, t = id / pc.bw, y = t % pc.bh, z = t / pc.bh;
-    uint wpb = pc.mode <= 2u ? 4u : (pc.mode <= 4u ? 1u : 2u);  // output words per block row
-    uint row0 = (z * pc.bh + y) * 4u, rowWords = pc.bw * wpb;
-    if (pc.mode <= 2u) {  // BC1, BC2, BC3 -> RGBA8
-        uint px[16];
-        if (pc.mode == 0u) {
-            bc1(src[id * 2u], src[id * 2u + 1u], true, px);
-        } else {
-            uint w0 = src[id * 4u], w1 = src[id * 4u + 1u];
-            bc1(src[id * 4u + 2u], src[id * 4u + 3u], false, px);
-            uint a[16];
-            if (pc.mode == 1u) {
-                for (int i = 0; i < 16; i++) a[i] = ex4(((i < 8 ? w0 : w1) >> (4 * (i & 7))) & 15u);
-            } else {
-                bc4(w0, w1, false, a);
-            }
-            for (int i = 0; i < 16; i++) px[i] = (px[i] & 0x00FFFFFFu) | (a[i] << 24);
+    uint bx = gl_GlobalInvocationID.x, by = gl_GlobalInvocationID.y, z = gl_GlobalInvocationID.z;
+    if (bx >= pc.bw || by >= pc.bh || z >= pc.slices) return;
+    uint mode = pc.mode;  // 0 BC1, 1 BC2, 2 BC3, 3/4 BC4 unsigned/signed, 5/6 BC5 unsigned/signed
+    bool wide = mode == 1u || mode == 2u || mode >= 5u;  // 16-byte blocks
+    uint index = (z * pc.bh + by) * pc.bw + bx;
+    uint base = wide ? index * 4u : index * 2u;
+    uint w0 = src[base], w1 = src[base + 1u], w2 = 0u, w3 = 0u;
+    if (wide) { w2 = src[base + 2u]; w3 = src[base + 3u]; }
+    uint row0 = (z * pc.bh + by) * 4u;
+    if (mode <= 2u) {  // BC1, BC2, BC3 -> RGBA8: colour in w0/w1 (BC1) or w2/w3, alpha in w0:w1
+        uint ends = mode == 0u ? w0 : w2, sel = mode == 0u ? w1 : w3;
+        uint c0 = ends & 65535u, c1 = ends >> 16u;
+        uvec3 a = rgb565(c0), b = rgb565(c1);
+        bool four = c0 > c1 || mode != 0u;
+        uint rowWords = pc.bw * 4u;
+        for (uint t = 0u; t < 16u; t++) {
+            uint px = color(a, b, four, (sel >> (t * 2u)) & 3u);
+            if (mode == 1u) px = (px & 0x00FFFFFFu) | (((((t < 8u ? w0 : w1) >> ((t & 7u) * 4u)) & 15u) * 17u) << 24u);
+            else if (mode == 2u) px = (px & 0x00FFFFFFu) | (channel(w0, w1, t, false) << 24u);
+            dst[(row0 + (t >> 2u)) * rowWords + bx * 4u + (t & 3u)] = px;
         }
-        for (uint r = 0u; r < 4u; r++)
-            for (uint c = 0u; c < 4u; c++) dst[(row0 + r) * rowWords + x * 4u + c] = px[r * 4u + c];
-    } else if (pc.mode <= 4u) {  // BC4 -> R8
-        uint v[16];
-        bc4(src[id * 2u], src[id * 2u + 1u], pc.mode == 4u, v);
-        for (uint r = 0u; r < 4u; r++)
-            dst[(row0 + r) * rowWords + x] = v[r * 4u] | (v[r * 4u + 1u] << 8) | (v[r * 4u + 2u] << 16) | (v[r * 4u + 3u] << 24);
-    } else {  // BC5 -> RG8
-        uint rr[16], gg[16];
-        bool sgn = pc.mode == 6u;
-        bc4(src[id * 4u], src[id * 4u + 1u], sgn, rr);
-        bc4(src[id * 4u + 2u], src[id * 4u + 3u], sgn, gg);
+    } else if (mode <= 4u) {  // BC4 -> R8
+        bool sgn = mode == 4u;
         for (uint r = 0u; r < 4u; r++) {
-            uint i = r * 4u;
-            dst[(row0 + r) * rowWords + x * 2u] = rr[i] | (gg[i] << 8) | (rr[i + 1u] << 16) | (gg[i + 1u] << 24);
-            dst[(row0 + r) * rowWords + x * 2u + 1u] = rr[i + 2u] | (gg[i + 2u] << 8) | (rr[i + 3u] << 16) | (gg[i + 3u] << 24);
+            uint t = r * 4u;
+            dst[(row0 + r) * pc.bw + bx] = channel(w0, w1, t, sgn) | (channel(w0, w1, t + 1u, sgn) << 8u) |
+                                           (channel(w0, w1, t + 2u, sgn) << 16u) | (channel(w0, w1, t + 3u, sgn) << 24u);
+        }
+    } else {  // BC5 -> RG8: red in w0:w1, green in w2:w3
+        bool sgn = mode == 6u;
+        uint rowWords = pc.bw * 2u;
+        for (uint r = 0u; r < 4u; r++) {
+            uint t = r * 4u, o = (row0 + r) * rowWords + bx * 2u;
+            dst[o] = channel(w0, w1, t, sgn) | (channel(w2, w3, t, sgn) << 8u) | (channel(w0, w1, t + 1u, sgn) << 16u) |
+                     (channel(w2, w3, t + 1u, sgn) << 24u);
+            dst[o + 1u] = channel(w0, w1, t + 2u, sgn) | (channel(w2, w3, t + 2u, sgn) << 8u) | (channel(w0, w1, t + 3u, sgn) << 16u) |
+                          (channel(w2, w3, t + 3u, sgn) << 24u);
         }
     }
 }
@@ -762,6 +984,12 @@ static VkPipeline bc_decoder() {
     const char* env = getenv("WWHD_BC_DECODE");
     if (env && !strcmp(env, "cpu")) {
         LOG("[vk] BC textures: decoded on the CPU (WWHD_BC_DECODE=cpu)");
+        return VK_NULL_HANDLE;
+    }
+    // Huawei's Maleoon driver (B236 on a Maleoon 910) aborted in its shader compiler shortly after
+    // start; the CPU decoder needs no shader. WWHD_BC_DECODE=gpu tries the compute shader anyway.
+    if (R.props.vendorID == 0x19E5 && !(env && !strcmp(env, "gpu"))) {
+        LOG("[vk] BC textures: decoded on the CPU (Huawei GPU; WWHD_BC_DECODE=gpu overrides)");
         return VK_NULL_HANDLE;
     }
     std::vector<uint32_t> spirv;
@@ -839,11 +1067,10 @@ static Upload bc_decode_gpu(const FormatInfo& f, const std::vector<uint8_t>& blo
     VkCommandBuffer cmd = command_buffer();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_bc.pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_bc.layout, 0, 1, &set, 0, nullptr);
-    const uint32_t n = bw * bh * slices;
-    const uint32_t pc[4] = {(uint32_t)f.convert - (uint32_t)Convert::BC1, bw, bh, n};
+    const uint32_t pc[4] = {(uint32_t)f.convert - (uint32_t)Convert::BC1, bw, bh, slices};
     vkCmdPushConstants(cmd, g_bc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
-    const uint32_t groups = (n + 63) / 64, gx = std::min(groups, 65535u);
-    vkCmdDispatch(cmd, gx, (groups + gx - 1) / gx, 1);
+    // one invocation per block, 8x8 blocks per workgroup, one workgroup layer per slice
+    vkCmdDispatch(cmd, (bw + 7) / 8, (bh + 7) / 8, slices);
     return out;
 }
 
@@ -985,6 +1212,10 @@ void upload_surface(Surface* s) {
     const bool is3D = s->img.type == VK_IMAGE_TYPE_3D;
     // BC without device support: decode all levels with one dispatch each, then copy them after one barrier
     const bool gpuBC = is_bc_decode(f.convert) && bc_decoder_checked();
+    // Qualcomm's driver (Adreno 650, driver 502) hangs the GPU (VK_ERROR_DEVICE_LOST) on some
+    // decodes recorded after render passes in the same command buffer, barrier or not; submitting
+    // the work before them avoids it
+    if (gpuBC && R.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) flush();
     std::vector<std::pair<Upload, VkBufferImageCopy>> decoded;
     for (uint32_t level = 0; level < s->img.mips; level++) {
         uint32_t base;
@@ -1032,6 +1263,127 @@ void upload_surface(Surface* s) {
         vkCmdCopyBufferToImage(command_buffer(), u.buf, s->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
 }
 
+// ---------------------------------------------------------------- write-back to guest memory
+// Render results stay on the GPU, except where the game reads them with the CPU: linear-aligned
+// render targets and GX2CopySurface destinations with a linear tile mode (as Cemu reads back linear
+// surfaces). The Picto Box draws its picture into a linear target and JPEG-encodes it from guest
+// memory (issue #22). Written at the guest size; only formats whose host texels are the guest's bytes.
+struct LinearCopy {
+    Surface* s;
+    LatteAddrLib::AddrSurfaceInfo_OUT info;
+    Latte::E_HWTILEMODE tm;
+    uint32_t base, layer, slice, w, h;
+};
+static std::vector<LinearCopy> g_linear_copies;  // GPU copies into linear destinations since the last GX2DrawDone
+
+static bool can_write_back(const Surface* s) {
+    const FormatInfo& f = s->fmt;
+    bool ok = !f.compressed && !f.depth && f.convert == Convert::NONE && f.hostBytesPerBlock == f.bytesPerBlock &&
+              s->img.type == VK_IMAGE_TYPE_2D && s->img.image;
+    if (!ok) {
+        static int logged = 0;
+        if (logged++ < 4) LOG("[gfx] linear surface %08X (format %X) is not written back to guest memory", s->addr, s->format);
+    }
+    return ok;
+}
+
+// one layer of s at the guest size w x h, read from the GPU (waits for it)
+static bool read_guest_texels(Surface* s, uint32_t layer, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
+    const uint32_t bytes = s->fmt.bytesPerBlock;
+    Image temp;
+    Image* src = &s->img;
+    uint32_t srcLayer = layer;
+    if (s->img.width != w || s->img.height != h) {  // drawn at the internal resolution: filter it down first
+        if (!create_image(temp, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, s->img.format, w, h, 1, 1, 1,
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false, false, false))
+            return false;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(R.pd, s->img.format, &fp);
+        const bool linear = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+        prepare(s->img, Use::COPY_SRC);
+        prepare(temp, Use::COPY_DST);
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {(int32_t)s->img.width, (int32_t)s->img.height, 1};
+        b.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+        vkCmdBlitImage(command_buffer(), s->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, temp.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        src = &temp;
+        srcLayer = 0;
+    }
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = (VkDeviceSize)w * h * bytes;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO;
+    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer buf;
+    VmaAllocation alloc;
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(R.vma, &bi, &ai, &buf, &alloc, &info) != VK_SUCCESS) {
+        if (src == &temp) retire_image(temp);
+        return false;
+    }
+    prepare(*src, Use::COPY_SRC);
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, srcLayer, 1};
+    c.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(command_buffer(), src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    VkBufferMemoryBarrier mb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.buffer = buf;
+    mb.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(command_buffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &mb, 0, nullptr);
+    wait_idle();
+    vmaInvalidateAllocation(R.vma, alloc, 0, VK_WHOLE_SIZE);
+    const uint8_t* raw = (const uint8_t*)info.pMappedData;
+    out.assign(raw, raw + (size_t)w * h * bytes);
+    vmaDestroyBuffer(R.vma, buf, alloc);
+    if (src == &temp) retire_image(temp);
+    return true;
+}
+
+// textures made from this memory see the new contents
+static void guest_memory_written(uint32_t addr) {
+    auto r = R.surfaces.equal_range(addr);
+    for (auto it = r.first; it != r.second; ++it) it->second->lastCheckedFrame = ~0ull;
+}
+
+void write_back_linear() {
+    std::vector<uint8_t> texels;
+    for (Surface* s : g_linear_targets) {
+        if (!s->gpuWritten || s->writtenBackSeq == s->writeSeq) continue;
+        s->writtenBackSeq = s->writeSeq;
+        if (s->img.layers != 1 || !can_write_back(s)) continue;
+        const uint32_t bytes = s->fmt.bytesPerBlock, pitch = std::max(s->pitch, s->width);
+        if (!read_guest_texels(s, 0, s->width, s->height, texels)) continue;
+        for (uint32_t y = 0; y < s->height; y++)
+            memcpy(mem::ptr(s->addr + y * pitch * bytes), texels.data() + (size_t)y * s->width * bytes, (size_t)s->width * bytes);
+        guest_memory_written(s->addr);
+        static int logged = 0;
+        if (logged++ < 8) LOG("[gfx] linear target %08X %ux%u (format %X) written to guest memory", s->addr, s->width, s->height, s->format);
+    }
+    auto copies = std::move(g_linear_copies);
+    g_linear_copies.clear();
+    for (const LinearCopy& lc : copies) {
+        if (!can_write_back(lc.s) || lc.layer >= lc.s->img.layers) continue;
+        if (!read_guest_texels(lc.s, lc.layer, lc.w, lc.h, texels)) continue;
+        const uint32_t bytes = lc.s->fmt.bytesPerBlock;
+        for (uint32_t y = 0; y < lc.h; y++)
+            for (uint32_t x = 0; x < lc.w; x++) {
+                uint32_t o = LatteAddrLib::ComputeSurfaceAddrFromCoordLinear(x, y, lc.slice, 0, bytes * 8, lc.info.pitch, lc.info.height,
+                                                                            lc.info.depth);
+                memcpy(mem::ptr(lc.base + o), texels.data() + ((size_t)y * lc.w + x) * bytes, bytes);
+            }
+        guest_memory_written(lc.base);
+        static int logged = 0;
+        if (logged++ < 8) LOG("[gfx] linear copy %08X %ux%u (format %X) written to guest memory", lc.base, lc.w, lc.h, lc.s->format);
+    }
+}
+
 // ---------------------------------------------------------------- GX2CopySurface
 static uint32_t level_address(GX2Surface* s, uint32_t level) {
     if (level == 0) return s->imagePtr;
@@ -1055,11 +1407,21 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
     uint32_t w = std::max<uint32_t>(s->width >> srcMip, 1), h = std::max<uint32_t>(s->height >> srcMip, 1);
     FormatInfo f = format_info((uint32_t)s->format.value(), false);
 
-    // GPU-produced source: copy image to image
-    auto range = R.surfaces.equal_range(sbase);
-    for (auto it = range.first; it != range.second; ++it) {
-        Surface* src = it->second.get();
-        if (!src->gpuWritten || src->width != w || src->height != h) continue;
+    // GPU-produced source: copy image to image. Of its format views the one in the source's own format
+    // (a newer view in another format is copied into it first), else the most recent.
+    Surface* src = nullptr;
+    {
+        const uint32_t srcFormat = (uint32_t)s->format.value();
+        auto range = R.surfaces.equal_range(sbase);
+        for (auto it = range.first; it != range.second; ++it) {
+            Surface* o = it->second.get();
+            if (!o->gpuWritten || o->width != w || o->height != h) continue;
+            if (!src || std::make_pair(o->format == srcFormat, o->writeSeq) > std::make_pair(src->format == srcFormat, src->writeSeq))
+                src = o;
+        }
+        src = adopt_newer_alias(src);
+    }
+    if (src) {
         SurfaceDesc dd;
         dd.addr = dbase;
         dd.width = std::max<uint32_t>(d->width >> dstMip, 1);
@@ -1067,9 +1429,9 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
         dd.pitch = d->pitch;
         dd.format = (uint32_t)d->format.value();
         dd.tileMode = (uint32_t)d->tileMode.value();
-        // As the original project's renderer: the destination keeps the source's kind (a depth copy
-        // goes into a depth surface, e.g. a shadow cascade, instead of a colour one whose format never
-        // matched and dropped the copy) and its own array shape, and the copy honours the slices
+        // As the official renderer: the destination keeps the source's kind (a depth copy into a
+        // depth surface, e.g. a shadow cascade, instead of a colour one whose format never matched
+        // and dropped the copy) and the destination's array shape, and the copy honours the slices
         // (every cascade landed in slice 0 before).
         static const bool oldCopy = getenv("WWHD_OLD_SURFACE_COPY") != nullptr;  // debug: as before
         if (!oldCopy) {
@@ -1095,33 +1457,45 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
             vkCmdCopyImage(command_buffer(), src->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         } else {  // different resolution scales: scale while copying
-            // the GPU can't blit every format (depth on some Adreno drivers, upstream #72): clear
-            // the slice instead of an invalid blit (depth 1, stencil/color 0; the game re-renders
-            // depth every frame)
-            VkFormat format = src->img.format;
-            if (format_can_blit(format) && !(dst->isDepth && depth_copy_none())) {
-                VkImageBlit b{};
-                b.srcSubresource = {src->img.aspect, 0, srcSlice, 1};
-                b.dstSubresource = {dst->img.aspect, 0, dstSlice, 1};
-                b.srcOffsets[1] = {(int32_t)src->img.width, (int32_t)src->img.height, 1};
-                b.dstOffsets[1] = {(int32_t)dst->img.width, (int32_t)dst->img.height, 1};
-                vkCmdBlitImage(command_buffer(), src->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img.image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, src->isDepth ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
-            } else {
-                log_cleared_copy(format, "scaled copies");
-                if (dst->isDepth) {
-                    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT | (dst->fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
-                    VkClearDepthStencilValue v{1.0f, 0};
-                    VkImageSubresourceRange range{aspect, 0, 1, dstSlice, 1};
-                    vkCmdClearDepthStencilImage(command_buffer(), dst->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
-                } else {
-                    VkClearColorValue v{};
-                    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, dstSlice, 1};
-                    vkCmdClearColorImage(command_buffer(), dst->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
-                }
+            // Adreno reports no BLIT_SRC/DST for D32_SFLOAT and D16_UNORM: a blit there is invalid
+            // (original project ac81cff/81e57e0, issue #72, draws such copies instead). The copy is
+            // left out; the game clears depth before it renders into it again.
+            static std::unordered_map<VkFormat, bool> blittable;
+            auto bl = blittable.find(src->img.format);
+            if (bl == blittable.end()) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(R.pd, src->img.format, &fp);
+                const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                bl = blittable.emplace(src->img.format, (fp.optimalTilingFeatures & need) == need).first;
+                if (!bl->second) LOG("[vk] format %d cannot be blitted: scaled surface copies of it are skipped", (int)src->img.format);
             }
+            if (!bl->second) return;
+            VkImageBlit b{};
+            b.srcSubresource = {src->img.aspect, 0, srcSlice, 1};
+            b.dstSubresource = {dst->img.aspect, 0, dstSlice, 1};
+            b.srcOffsets[1] = {(int32_t)src->img.width, (int32_t)src->img.height, 1};
+            b.dstOffsets[1] = {(int32_t)dst->img.width, (int32_t)dst->img.height, 1};
+            vkCmdBlitImage(command_buffer(), src->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, src->isDepth ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
         }
         mark_gpu_written(dst);
+        // a linear destination is read by the CPU (the Picto Box picture): written back at GX2DrawDone
+        if (!dst->isDepth) {
+            LinearCopy lc{};
+            LatteAddrLib::GX2CalculateSurfaceInfo(d->format, d->width, d->height, d->depth, d->dim, d->tileMode, d->aa, dstMip, &lc.info);
+            lc.tm = (Latte::E_HWTILEMODE)lc.info.hwTileMode;
+            if ((lc.tm == Latte::E_HWTILEMODE::TM_LINEAR_GENERAL || lc.tm == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED) &&
+                dstSlice < std::max<uint32_t>(lc.info.depth, 1)) {
+                lc.s = dst;
+                lc.base = dbase;
+                lc.layer = dstSlice;
+                lc.slice = dstSlice;
+                lc.w = std::min(dd.width, w);
+                lc.h = std::min(dd.height, h);
+                g_linear_copies.push_back(lc);
+                write_back_linear();  // the game reads it as soon as GX2CopySurface returns
+            }
+        }
         return;
     }
 
@@ -1149,12 +1523,22 @@ void copy_surface_impl(uint32_t srcAddr, uint32_t srcMip, uint32_t srcSlice, uin
     for (auto it = dr.first; it != dr.second; ++it) it->second->lastCheckedFrame = ~0ull;
 }
 
-// a save state was loaded: every surface may differ from guest memory now
+// a save state was loaded: every surface may differ from guest memory now. What the GPU drew is of
+// the moment before: a target the game samples as a texture is read from memory again (those at the
+// guest's size, in colour; the scaled ones are drawn whole every frame anyway), the depth buffer
+// peek_z reads is forgotten, and the shader programs are hashed afresh (other code may sit at their
+// addresses)
 void ss_reset_surfaces() {
     for (auto& [a, s] : R.surfaces) {
         s->dirty = true;
         s->lastCheckedFrame = ~0ull;
+        if (s->gpuWritten && !s->isDepth && s->img.width == s->width && s->img.height == s->height) {
+            s->gpuWritten = false;
+            s->contentHash = 0;  // uploaded even when the memory holds what was uploaded before the GPU drew into it
+        }
     }
+    R.mainDepthAddr = 0;
+    ss_reset_programs();
 }
 
 }  // namespace gfx

@@ -3,13 +3,74 @@
     <string name="app_name">TLoZ:TWW HD Recompiled</string>
 
     <string name="setup_text">The game files were not found or don\'t match this build.\n\nThis app contains only the recompiled code built from your own copy of the game; it needs the extracted game files from the same dump. Extract them on a computer (see README.md: tools/wudextract.py), then copy the resulting folder (with code/, content/ and meta/ inside) to:\n\n%1$s\n\nFor example: adb push game /sdcard/Android/data/org.wwhdrecomp.app/files/\n\nProblem: %2$s</string>
+    <string name="touch_skip">Skip</string>
+    <string name="motion_source_pad">Now: the sensors of %1$s</string>
+    <string name="motion_source_device">Now: this device\'s sensors</string>
+    <string name="motion_source_device_no_pad">Now: this device\'s sensors (the controller in use reports none)</string>
+    <string name="motion_source_off">Now: off</string>
+    <string name="gpu_safe_title">GPU safe mode</string>
+    <string name="restart_needed">This applies after a restart.</string>
+    <string name="gpu_safe_notice">The game closed last time because of the GPU driver (%2$s). It now runs in GPU safe mode level %1$d, which avoids features some drivers handle badly. You can change it under Graphics › GPU safe mode.</string>
+    <string name="opt_gpu_safe">GPU safe mode</string>
+    <string name="opt_gpu_safe_hint">Turned on by itself after a GPU driver crash; avoids features some drivers handle badly. Applies after a restart</string>
+    <string-array name="gpu_safe_modes">
+        <item>Off</item>
+        <item>Basic</item>
+        <item>Maximum</item>
+    </string-array>
+    <string name="opt_ptbr">Portuguese (Brazil) translation</string>
+    <string name="opt_ptbr_hint">The game\'s text in Brazilian Portuguese (Triforce-Heroes fan translation)</string>
+    <string name="ptbr_not_installed">not installed</string>
+    <string name="ptbr_about">Plays the game with the Brazilian Portuguese fan translation by Triforce-Heroes (triforce-heroes.com.br). The translation replaces the English text, so turning it on sets the game language to English. If it isn\'t installed, choose its folder (the Cemu version or the console version, the folder with rules.txt).</string>
+    <string name="ptbr_install">Install the translation…</string>
+    <string name="ptbr_install_hint">Choose the translation\'s folder</string>
+    <string name="ptbr_install_other">Install another translation (any language)…</string>
+    <string name="ptbr_installed">Installed: %1$s</string>
+    <string name="ptbr_toggle_hint">Applies after a restart</string>
+    <string name="ptbr_remove">Remove the translation</string>
+    <string name="ptbr_remove_confirm">Delete the installed translation files? You can install them again later.</string>
+    <string name="ptbr_installing">Installing the translation…</string>
+    <string name="ptbr_failed">The translation could not be installed: %1$s</string>
+    <string name="ptbr_not_found">No translation files (permanent_2d_*.pack) in that folder.</string>
+    <string name="ptbr_on_restart">The translation is on and the game language is English. Restart the game to play in Portuguese.</string>
+    <string name="ptbr_off_restart">The translation is off. Restart the game to apply.</string>
+    <string name="opt_camera_stick">Camera stick</string>
+    <string name="opt_camera_stick_hint">A stick on the right that turns the camera (move it in Edit touch layout). Swiping the right side still works</string>
+    <string name="opt_hud">HUD layout</string>
+    <string name="opt_hud_hint">Move, resize or hide the hearts, rupees, buttons and the rest of the game\'s HUD</string>
+    <string name="hud_hidden">hidden</string>
+    <string name="hud_hide_all">Hide HUD</string>
+    <string name="hud_show_all">Show HUD</string>
+    <string name="hud_edit_hint">Touch a part · drag to move · corner handle or pinch to resize · 🗑 hides it, + shows it · ↺ resets · ✓ or Back to finish</string>
+    <string-array name="hud_parts">
+        <item>Hearts and magic</item>
+        <item>Rupees</item>
+        <item>Item buttons</item>
+        <item>Small keys</item>
+        <item>Wind compass and clock</item>
+    </string-array>
+    <string name="opt_app_language">App language</string>
+    <string name="opt_app_language_hint">This app\'s menus and messages (the game\'s text is under Game › Game language, or the translation in Mods)</string>
+    <string-array name="app_languages">
+        <item>System</item>
+        <item>English</item>
+        <item>Português (Brasil)</item>
+        <item>Español</item>
+        <item>العربية</item>
+    </string-array>
+    <string name="pad_face_bottom">Bottom face button (A / Cross)</string>
+    <string name="pad_face_right">Right face button (B / Circle)</string>
+    <string name="pad_face_left">Left face button (X / Square)</string>
+    <string name="pad_face_top">Top face button (Y / Triangle)</string>
+    <string name="opt_menu_size">Menu size</string>
+    <string name="opt_menu_size_hint">The menus fit the screen on their own; this makes them smaller or larger.</string>
     <string name="setup_retry">Check again</string>
     <string name="setup_welcome">Welcome!\n\nThis app contains no game files. It plays your own copy of The Legend of Zelda: The Wind Waker HD for Wii U (USA, European or Japanese version).\n\nPut these three files in one folder on this device, then choose that folder:\n•  your disc image (.wux or .wud)\n•  its disc key (the image\'s name with .key)\n•  the console\'s common key (common.key)\n\nOr put a Cemu archive of your game (.wua) in a folder; it needs no keys.\n\nThe app then extracts the game files (about 1.7 GB) and prepares the game code for this device. That happens once and takes a while, depending on the device\'s processor.</string>
     <string name="setup_problem">The game files found don\'t work: %1$s</string>
     <string name="setup_extract">Extract from your disc image or .wua…</string>
     <string name="extract_missing">Choose the folder that holds your disc image, its disc key and the console\'s common key:\n\n%1$s the image (.wux or .wud)\n%2$s its disc key (the image\'s name with .key)\n%3$s common.key\n\nOr a folder that holds a Cemu archive of your game (.wua).</string>
     <string name="extract_bad_key">A key file must hold 16 bytes or 32 hex digits.</string>
-    <string name="extract_running">Extracting the game from your disc image…</string>
+    <string name="extract_running">Extracting the game files…</string>
     <string name="extract_detail">%1$d of %2$d MB (%3$.0f MB/s)</string>
     <string name="extract_detail_short">%1$d of %2$d MB</string>
     <string name="work_channel">Game setup</string>
@@ -62,7 +123,7 @@
     <string name="backup_exporting">Exporting…</string>
     <string name="backup_exported">Exported to the folder \"%1$s\".</string>
     <string name="backup_scanning">Looking for saves…</string>
-    <string name="backup_nothing">No game save (cking.sav) or save states (slot1–5.bin/.wwstate) found in this folder.</string>
+    <string name="backup_nothing">No game save (cking.sav) or save states (slot1–5.bin) found in this folder.</string>
     <string name="backup_import_title">Import (replaces what is there)</string>
     <string name="backup_import_save">Game save (from %1$s)</string>
     <string name="backup_import_states">Save states: slot %1$s</string>
@@ -90,6 +151,7 @@
     <string name="fg_multiplier">Multiplier: ×%1$d (%2$d fps)</string>
     <string name="fg_multiplier_title">Frames per game frame</string>
     <string name="fg_multiplier_item">×%1$d (%2$d fps)</string>
+    <string name="fg_multiplier_item_over">×%1$d (%2$d fps: more than the display shows, no generated frames)</string>
     <string name="fg_mode">Network: %1$s</string>
     <string name="fg_performance">Performance</string>
     <string name="fg_quality">Quality (more GPU load)</string>
@@ -140,12 +202,22 @@
     <string name="opt_export_hint">Copy your game save and save states to a folder</string>
     <string name="opt_import">Import saves</string>
     <string name="opt_import_hint">Restore them from a folder; an imported game save restarts the game</string>
-    <string name="opt_bugreport">Copy save for bug report</string>
-    <string name="opt_bugreport_hint">Save where Link stands and share it with your game save</string>
-    <string name="bugreport_saved">Bug report state saved</string>
-    <string name="bugreport_missing">Nothing to share: the bug report state and the game save are both missing.</string>
-    <string name="bugreport_share">Share bug report saves</string>
-    <string name="bugreport_subject">Wind Waker HD bug report saves</string>
+    <string name="opt_auto_backup">Automatic save backup</string>
+    <string name="opt_auto_backup_hint">Keeps a copy of your game save in Downloads/WindWakerHD Saves, which survives uninstalling the app</string>
+    <string name="opt_autosave">Autosave</string>
+    <string name="opt_autosave_hint">Saves a snapshot into the Auto slot at this interval while you play</string>
+    <string-array name="autosave_intervals">
+        <item>Off</item>
+        <item>Every 1 min</item>
+        <item>Every 2 min</item>
+        <item>Every 5 min</item>
+        <item>Every 10 min</item>
+    </string-array>
+    <string name="opt_slot_auto">Auto (autosave)</string>
+    <string name="restore_title">Restore your game save?</string>
+    <string name="restore_message">There is no game save yet. If you played before (an earlier version of the app, or a backup), pick the folder that holds it: the \"%1$s\" folder in Downloads has the automatic backups, or pick a folder you exported to. You can also do this later in Options > Saves > Import saves.</string>
+    <string name="restore_new_game">New game</string>
+    <string name="restore_pick">Choose folder…</string>
     <string name="opt_graphics">Graphics</string>
     <string name="opt_mods">Mods</string>
     <string name="opt_controls">Controls</string>
@@ -154,7 +226,74 @@
     <string name="opt_cancel">Cancel</string>
     <string name="opt_on">ON</string>
     <string name="opt_off">OFF</string>
-    <string name="opt_pad_hint">Controller: hold Select or press Home to open and close · L / R switch tabs · D-pad moves and changes values · right button selects · bottom button goes back</string>
+    <string name="opt_pad_hint">Controller: Select + Start, hold Select or press Home to open and close · L / R switch tabs · D-pad moves and changes values · right button selects · bottom button goes back</string>
+    <string name="lang_restart">The new language takes effect when the game restarts. Progress since your last save is lost.</string>
+    <string name="opt_fps">Frame rate</string>
+    <string name="opt_fps_hint">60 fps (generated): the game runs at its own 30 and every other frame is made on the GPU from the last one (smooth on most phones; the HUD and the screen edges may show small artifacts). 60 and 120 fps interpolate frames on the CPU and need a fast phone; where a frame doesn\'t fit in time it is left out and the game keeps its speed</string>
+    <string-array name="fps_modes">
+        <item>30 fps</item>
+        <item>60 fps</item>
+        <item>60 fps</item>
+        <item>True 60 (experimental)</item>
+    </string-array>
+    <string name="fps_40">40 fps (120 Hz screen)</string>
+    <string name="fps_generated">60 fps (generated)</string>
+    <string name="fps_120">120 fps (120 Hz screen)</string>
+    <string name="opt_layout_edit">Edit touch layout</string>
+    <string name="opt_layout_edit_hint">Move and resize every control on a grid (also the ✎ button next to ≡)</string>
+    <string name="layout_edit_hint">Drag to move · corner handle or pinch to resize · 🗑 removes the selected control · + puts removed ones back · Back cancels</string>
+    <string name="layout_add_title">Touch a control to put it back</string>
+    <string name="opt_camera_sensitivity">Camera swipe speed</string>
+    <string name="opt_camera_sensitivity_hint">Swipe on the right side of the screen to turn the camera; double tap there to centre it</string>
+    <string name="opt_combat_buttons">Combat buttons</string>
+    <string name="opt_combat_buttons_hint">Jump attack, vertical slash, spin attack and dodge in one touch</string>
+    <string-array name="combat_buttons">
+        <item>With a sword</item>
+        <item>Always</item>
+        <item>Hidden</item>
+    </string-array>
+    <string name="opt_haptics">Vibrate on touch</string>
+    <string name="opt_cheats">Cheats</string>
+    <string name="opt_cheats_hint">Items, sword and shield, hearts, infinite health…</string>
+    <string name="opt_button_style">Button icons</string>
+    <string name="opt_button_style_hint">The buttons\' symbols on the touch controls and in the game (its HUD and text): Wii U, Xbox or PlayStation, following the controller buttons you assigned. The game\'s icons change after a restart</string>
+    <string-array name="button_styles">
+        <item>Wii U (Nintendo)</item>
+        <item>Xbox</item>
+        <item>PlayStation</item>
+    </string-array>
+    <string name="cheat_note">Cheats change the loaded save file; they last once the game is saved. The game itself takes the sword away in Forsaken Fortress and the bow in the Tower of the Gods.</string>
+    <string name="cheat_apply">Apply</string>
+    <string name="cheat_done">Cheat applied</string>
+    <string name="cheat_items">All items</string>
+    <string name="cheat_sword">Best sword and shield</string>
+    <string name="cheat_stats">Full hearts, magic and wallet</string>
+    <string name="cheat_songs">All songs</string>
+    <string name="cheat_triforce">All Triforce shards</string>
+    <string name="cheat_dungeon">Map, compass and boss key (this dungeon)</string>
+    <string name="cheat_key">A small key (this dungeon)</string>
+    <string name="cheat_story_hint">Story progress: can change or break story events</string>
+    <string name="cheat_inf_health">Infinite health</string>
+    <string name="cheat_inf_magic">Infinite magic</string>
+    <string name="cheat_inf_ammo">Infinite arrows and bombs</string>
+    <string name="opt_gyro_recalibrate">Recalibrate gyro</string>
+    <string name="opt_gyro_recalibrate_hint">Hold the phone as you play and press: that becomes straight ahead</string>
+    <string name="gyro_recalibrated">Gyro recalibrated</string>
+    <string name="opt_drawdone">Experimental: GX2DrawDone</string>
+    <string name="opt_drawdone_hint">Lets the game prepare the next frame while the renderer works. May cause visual glitches: for testing only.</string>
+    <string-array name="drawdone_modes">
+        <item>Wait (default)</item>
+        <item>One behind</item>
+        <item>No wait</item>
+    </string-array>
+    <string name="opt_core_mode">CPU cores</string>
+    <string name="opt_core_mode_hint">Where the game and renderer run. Performance cores: least heat for steady play. Prime core: fastest renderer, hottest.</string>
+    <string-array name="core_modes">
+        <item>Automatic</item>
+        <item>Performance cores</item>
+        <item>Prime core (renderer)</item>
+        <item>Prime core (game)</item>
+    </string-array>
     <string name="opt_resolution">Rendering resolution</string>
     <string name="opt_framegen">Frame generation</string>
     <string name="opt_aspect">Aspect ratio</string>
@@ -166,8 +305,14 @@
     </string-array>
     <string name="opt_layout">Screen layout</string>
     <string name="opt_ao">Ambient occlusion</string>
+    <string name="opt_bloom">Bloom strength</string>
+    <string name="opt_bloom_hint">Glow around bright areas. 100% matches the original game</string>
+    <string name="opt_area_blur">Console-accurate blur</string>
+    <string name="opt_area_blur_hint">Above 1x resolution: removes the fine grid in shadows and around objects on the ground. Costs GPU time</string>
     <string name="opt_ao_hires">Full-size occlusion depth</string>
     <string name="opt_aniso">16× anisotropic filtering</string>
+    <string name="opt_distant_shadows">Distant shadows</string>
+    <string name="opt_distant_shadows_hint">The far shadows. Off: less GPU work in forests and open areas, for weaker phones</string>
     <string name="opt_perf">Performance overlay</string>
     <string name="opt_perf_hint">FPS, load and temperatures</string>
     <string name="opt_fg_choose_dll">Select Lossless.dll</string>
@@ -195,6 +340,9 @@
     <string name="opt_mod_quick_doors">Quick doors</string>
     <string name="opt_mod_fast_scenes">Fast scene changes</string>
     <string name="opt_mod_speed_hint">4× speed</string>
+    <string name="opt_mod_ff_cutscenes">Fast forward cutscenes</string>
+    <string name="opt_mod_ff_dialogues">Fast forward dialogues</string>
+    <string name="opt_mod_ff_hint">Faster (up to 4×, as fast as this device draws) while ZR (R2) is held; text boxes still wait for your button</string>
     <string name="opt_mod_run">Faster running</string>
     <string name="opt_mod_run_hint">Link covers more ground while running; jumps and rolls stay as they are</string>
     <string name="opt_mod_swim">Faster swimming</string>
@@ -215,10 +363,42 @@
     <string name="opt_language">Game language</string>
     <string name="opt_language_hint">The languages of your copy of the game; applies after a restart</string>
     <string name="language_restart">The game uses the new language after a restart.</string>
+    <string name="opt_interp">Frame rate</string>
+    <string name="opt_interp_hint">Frame interpolation: in-between frames from the game\'s 30 fps. Needs a fast CPU; where a frame doesn\'t fit in time it is left out and the game keeps its speed</string>
+    <string name="interp_off">30 fps (original)</string>
+    <string name="interp_fps">%d fps (interpolated)</string>
+    <string name="cache_loading">Loading the shader cache…</string>
+    <string name="cache_loading_detail">%1$,d shader variants prepared</string>
+    <string name="cache_building">Preparing every shader before the game starts…</string>
+    <string name="cache_building_detail">%1$,d of %2$,d pipelines</string>
+    <string name="opt_dynamic_res">Dynamic resolution</string>
+    <string name="opt_dynamic_res_hint">Lowers the 3D resolution while the GPU can\'t keep up (to 0.6x, so weak phones keep their frame rate) or the phone is hot (to 1x), and raises it back when there is room again</string>
+    <string name="dynamic_res_now">Now: %1$sx (GPU load or temperature)</string>
+    <string name="opt_shaders_at_start">Prepare all shaders at start</string>
+    <string name="opt_shaders_at_start_hint">Builds every shader the game has used behind the loading screen: no stutters while playing, a longer load. Takes effect at the next start</string>
+    <string name="cheat_moon_jump">Moon jump</string>
+    <string name="cheat_moon_jump_hint">Hold L (left shoulder button) to rise, steer with the left stick</string>
+    <string name="cheat_moon_rise">Moon jump: rise speed</string>
+    <string name="cheat_moon_fly">Moon jump: flight speed</string>
+    <string name="cheat_moon_nofall">Moon jump: no fall damage</string>
+    <string name="cheat_moon_nofall_hint">Landing after a flight never hurts</string>
+    <string name="cheat_moon_anims">Moon jump: random lift-off animations</string>
+    <string name="cheat_moon_anims_hint">Each lift-off picks one of 14 poses instead of the two jump poses</string>
+    <string name="opt_record_thread">Command recording thread</string>
+    <string name="opt_record_thread_hint">A second CPU thread prepares the GPU work: faster on most devices, slower on some (e.g. Snapdragon 855)</string>
+    <string-array name="record_thread_modes">
+        <item>Automatic</item>
+        <item>On</item>
+        <item>Off</item>
+    </string-array>
+    <string name="record_thread_restart">The setting applies after a restart.</string>
     <string name="opt_motion">Motion controls</string>
     <string name="opt_motion_hint">Aim by tilting the device, or a controller with motion sensors</string>
     <string name="opt_rumble">Rumble</string>
-    <string name="opt_rumble_hint">On the controller, or this device while playing by touch</string>
+    <string name="opt_rumble_hint">On the controller, or this device if the controller has no rumble or while playing by touch</string>
+    <string name="opt_select_map">Select opens the map</string>
+    <string name="opt_select_map_hint">A short press of the controller\'s Select opens the menu on the MAP tab (from play or from another tab)</string>
+    <string name="autosave_done">Autosaved (Auto slot)</string>
     <string name="opt_buttons">Controller buttons</string>
     <string name="opt_buttons_hint">Which controller button presses which Wii U button</string>
     <string name="opt_buttons_default">Default</string>
@@ -262,7 +442,18 @@
     <string name="gpu_driver_not_package">this is not a driver package (a .zip with meta.json and the driver\'s .so file)</string>
     <string name="gpu_driver_installed">%1$s is installed. Use it now? The game restarts.</string>
     <string name="gpu_driver_use_now">Use and restart</string>
+    <string name="gpu_lost_title">The GPU driver stopped responding</string>
+    <string name="gpu_lost_system">The game closed last time because the phone\'s GPU driver hung:\n%1$s\n\nThis can happen with buggy system drivers. A Turnip driver usually runs the game. Choose a driver package (a .zip in the AdrenoTools format, e.g. a recent Turnip build for your Adreno) to use it from now on, or start the game as it is.</string>
+    <string name="gpu_lost_custom">The game closed last time because the installed GPU driver hung:\n%1$s\n\nGo back to the system driver, choose another driver package, or start the game with this one again.</string>
+    <string name="gpu_lost_unknown_driver">(unknown driver)</string>
+    <string name="gpu_lost_start">Start the game</string>
+    <string name="gpu_lost_choose">Choose a driver file…</string>
+    <string name="gpu_lost_choose_other">Another driver file…</string>
+    <string name="gpu_lost_system_driver">Back to the system driver</string>
     <string name="gpu_driver_later">Later</string>
+    <string name="rotation_title">Screen rotation</string>
+    <string name="rotation_message">This phone\'s system keeps the screen in portrait and ignores that the game is landscape only, so the game shows in a strip. Allow the app to change the rotation setting and it locks the screen in landscape while you play (following the side you hold the phone), then gives your setting back when you leave the game.</string>
+    <string name="rotation_allow">Allow</string>
     <string name="gpu_driver_use">Use</string>
     <string name="gpu_driver_remove">Remove</string>
     <string name="gpu_driver_switch">Switch to %1$s? The game restarts; the first start with another driver compiles its pipelines again and takes longer.</string>
@@ -276,6 +467,7 @@
     <string name="crash_share">Share crash log</string>
     <string name="crash_share_all">Share crash logs</string>
     <string name="crash_not_now">Not now</string>
+    <string name="crash_start_game">Start game</string>
     <string name="crash_subject">Wind Waker HD crash log</string>
     <string name="opt_quit">Quit</string>
     <string name="menu_capture">Capture frame (debugging)</string>
@@ -295,26 +487,74 @@
         <item>TV and GamePad side by side</item>
         <item>TV only</item>
         <item>GamePad with TV inset</item>
+        <item>Hybrid: TV, GamePad full screen in menus</item>
     </string-array>
     <string-array name="ao_modes">
         <item>Original (as on Wii U)</item>
         <item>Centre fix</item>
         <item>Centre + noise fix</item>
+        <item>Off</item>
     </string-array>
-    <string name="opt_arabic">Arabic translation</string>
-    <string name="opt_arabic_hint">Hesham\'s Arabic translation, once imported below; applies after a restart</string>
-    <string name="opt_arabic_import">Import Arabic files…</string>
-    <string name="opt_arabic_import_hint">Unpacks the translation\'s .zip: the Arabic game text and title logo</string>
-    <string name="arabic_restart">The game uses the Arabic translation after a restart.</string>
-    <string name="arabic_none">Not installed</string>
-    <string name="arabic_partial">Incomplete</string>
-    <string name="arabic_installed">Installed</string>
-    <string name="arabic_installing">Installing the Arabic files…</string>
-    <string name="arabic_install_failed">The Arabic files couldn\'t be installed: %1$s</string>
-    <string name="arabic_not_package">this is not a translation package (a .zip with permanent_2d_*.pack)</string>
-    <string name="arabic_no_files">No Arabic files are imported yet. Import the translation\'s .zip now?</string>
-    <string name="arabic_import_now">Import…</string>
-    <string name="arabic_both">the game text and the title logo</string>
-    <string name="arabic_text_only">the game text (the archive has no title logo)</string>
-    <string name="arabic_installed_restart">Installed %1$s.\nThe game uses it after a restart.</string>
+    <!-- SaveVault: saves kept outside the app -->
+    <string name="vault_title">Keep your saves safe</string>
+    <string name="vault_message">Allow \"All files access\" and the app keeps a copy of your game save, your save states and your settings in the \"%1$s\" folder on your phone. It stays there when the app is uninstalled or updated, and a new install brings everything back by itself.</string>
+    <string name="vault_message_new">There is no game save yet. If you played before, allow \"All files access\" and the app brings back your game save, save states and settings from the \"%1$s\" folder (or from the automatic backups in Downloads) by itself, and keeps them there from now on, so an update never loses them.</string>
+    <string name="vault_later">Not now</string>
+    <string name="vault_allow">Allow</string>
+    <string name="vault_on_toast">Your saves are now kept in the \"%1$s\" folder too</string>
+    <string name="vault_restored_title">Your saves are back</string>
+    <string name="vault_restoring">Bringing your saves back…</string>
+    <string name="vault_part_save">your game save</string>
+    <string name="vault_part_settings">your settings</string>
+    <string name="vault_restored">Brought back from \"%2$s\": %1$s.</string>
+    <string name="vault_restart">The settings take effect after a restart.</string>
+    <string name="opt_vault">Saves outside the app</string>
+    <string name="opt_vault_hint">Off: allow \"All files access\" to keep a copy in the \"%1$s\" folder that survives updates and reinstalls</string>
+    <string name="opt_vault_hint_on">Your game save, save states and settings are copied to the \"%1$s\" folder as they change; a new install brings them back by itself</string>
+    <string name="vault_about_on">Your game save, save states and settings are copied to the \"%1$s\" folder on your phone as they change. After uninstalling or updating the app, the new install brings them back by itself when it starts without a game save. Don\'t delete that folder.</string>
+    <string name="language_ptbr">Português (Brasil)</string>
+    <plurals name="vault_part_states">
+        <item quantity="one">%d save state</item>
+        <item quantity="other">%d save states</item>
+    </plurals>
+    <!-- light graphics -->
+    <string name="opt_light">Graphics</string>
+    <string name="opt_light_hint">Light: for weaker GPUs. No ambient occlusion and no distant shadows</string>
+    <string-array name="light_modes">
+        <item>Quality</item>
+        <item>Light</item>
+    </string-array>
+    <string name="opt_packs">Content packs (Cemu mods)</string>
+    <string name="opt_packs_hint">Cemu graphic packs that replace the game\'s files: models, textures, text</string>
+    <string name="packs_about">A content pack is a Cemu graphic pack with a content folder (the Linkle mod, texture packs, translations): its files are read instead of the game\'s. Cemu\'s code patches can\'t be applied to the recompiled game and are left out. Install one from a folder below, or (with All files access) copy its folder into %1$s. Packs higher in the list win. The game restarts to apply changes.</string>
+    <string name="packs_install">Install a pack from a folder…</string>
+    <string name="packs_install_hint">The folder of an unpacked Cemu graphic pack</string>
+    <string name="packs_installing">Installing the content pack…</string>
+    <string name="packs_failed">The pack couldn\'t be installed: %1$s</string>
+    <string name="packs_not_found">No content folder in that pack (only Cemu\'s content packs are supported, not code patches).</string>
+    <string name="packs_remove">Remove %1$s</string>
+    <string name="language_arabic">العربية (ترجمة هشام)</string>
+    <string name="opt_arabic">ترجمة هشام (العربية)</string>
+    <string name="opt_arabic_hint">تعريب كامل للنصوص والشعار بواسطة هشام (arabichesham.com) مع دعم الكتابة من اليمين لليسار</string>
+    <string name="opt_arabic_import">استيراد ملفات الترجمة (.zip)…</string>
+    <string name="opt_arabic_import_other">استيراد حزمة ترجمة أخرى (.zip)…</string>
+    <string name="opt_arabic_import_hint">اختر ملف .zip المحمّل من موقع تعريبات هشام (arabichesham.com)</string>
+    <string name="arabic_install_folder">استيراد من مجلد…</string>
+    <string name="arabic_install_folder_hint">اختر مجلداً يحتوي على ملفات التعريب</string>
+    <string name="arabic_about">ترجمة اللعبة إلى اللغة العربية بواسطة الأخ هشام (Arabic Hesham). يدعم هذا الإصدار قراءة وتنسيق النصوص العربية تلقائياً من اليمين إلى اليسار (RTL) بالإضافة إلى شعار البداية المعرب.</string>
+    <string name="arabic_restart">ستعمل اللعبة باللغة العربية بعد إعادة التشغيل.</string>
+    <string name="arabic_on_restart">تم تفعيل التعريب العربي. ستعمل اللعبة به بعد إعادة التشغيل.</string>
+    <string name="arabic_off_restart">تم تعطيل التعريب. ستعود اللعبة للغتها الأصلية بعد إعادة التشغيل.</string>
+    <string name="arabic_none">غير مُثبت</string>
+    <string name="arabic_partial">ملفات جزئية (نصوص اللعبة فقط)</string>
+    <string name="arabic_installed">مُثبت بالكامل (النصوص وشعار البداية)</string>
+    <string name="arabic_installed_status">حالة التعريب: %1$s</string>
+    <string name="arabic_installing">جارٍ تثبيت ملفات التعريب العربي…</string>
+    <string name="arabic_install_failed">فشل تثبيت ملفات التعريب: %1$s</string>
+    <string name="arabic_not_package">لم يتم العثور على حزمة ترجمة صالحة (ملف .zip يحتوي على permanent_2d_*.pack)</string>
+    <string name="arabic_both">نصوص اللعبة وشعار البداية المعرب</string>
+    <string name="arabic_text_only">نصوص اللعبة (الأرشيف لا يحتوي على شعار البداية)</string>
+    <string name="arabic_installed_restart">تم تثبيت %1$s بنجاح.\nسيبدأ استخدام التعريب بعد إعادة التشغيل.</string>
+    <string name="arabic_remove">إزالة ملفات التعريب</string>
+    <string name="arabic_remove_confirm">هل أنت متأكد من حذف ملفات التعريب العربي المثبتة؟</string>
 </resources>

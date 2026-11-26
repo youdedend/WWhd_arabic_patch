@@ -44,7 +44,6 @@
 
 #include "input.h"
 #include "mods.h"
-#include "../motion.h"
 #include "runtime.h"
 
 extern "C" {
@@ -161,6 +160,16 @@ void test_goto(input::PadState& s) {
     s.lx = std::sin(phi);
     s.ly = std::cos(phi);
 }
+// test aid: WWHD_TEST_POSLOG=1 logs Link's position, heading and the stage every second
+void test_poslog() {
+    static const bool on = getenv("WWHD_TEST_POSLOG") != nullptr;
+    static uint64_t lastStep = 0;
+    if (!on || step() < lastStep + 30) return;
+    lastStep = step();
+    uint32_t l = g_link.load(std::memory_order_relaxed);
+    if (!l) return;
+    LOG("[pos] %.0f %.0f %.0f heading %d", ldf32(l + 0x314), ldf32(l + 0x318), ldf32(l + 0x31C), (int)(int16_t)ld16(l + 0x322));
+}
 bool test_mouse() {
     static const bool on = getenv("WWHD_TEST_MOUSE") != nullptr;
     return on;
@@ -185,15 +194,14 @@ void mouse_button(int button, bool down) {
 // end of input::read(): synthetic right stick for the mouse, R3 pulses for the wheel, left click
 void filter_pad(input::PadState& s) {
     run_input(s.buttons);  // faster running's L3 (mods.cpp)
+    stick_input(s.lx, s.ly);  // the moon jump's steering (cheats.cpp)
     inject_test_mouse();
     test_goto(s);
+    test_poslog();
     uint64_t now = step();
     std::lock_guard<std::mutex> lk(g_mu);
     // stale movement (the camera never took it, e.g. during an event) is dropped
     if (g_move_step != ~0ull && now > g_move_step + 8) g_dx = g_dy = 0;
-    // gyro (motion.h): the game turns its first-person (subject) camera with the GamePad's motion,
-    // which every item aim uses too; the aiming state feeds the gyro diagnostics
-    motion::set_aiming(in_first_person() || aiming_item(link_proc()));
     // mouse camera
     bool active = mouse_camera() && (mouse_captured() || test_mouse());
     bool stick_free = std::fabs(s.rx) < 0.2f && std::fabs(s.ry) < 0.2f;

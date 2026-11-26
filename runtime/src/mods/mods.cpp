@@ -6,6 +6,8 @@
 //   WWHD_MOD_FIRST_PERSON=1    first person on R3 / mouse wheel
 //   WWHD_MOD_QUICK_DOORS=1     quick doors
 //   WWHD_MOD_FAST_SCENES=1     fast scene changes
+//   WWHD_MOD_FF_CUTSCENES=1    fast forward of cutscenes while ZR is held (WWHD_MOD_FF_RATE=4: display clock rate)
+//   WWHD_MOD_FF_DIALOGUES=1    the same for dialogues
 //   WWHD_MOD_RUN_SPEED=1.5     faster running (distance per step while Link runs)
 //   WWHD_MOD_SWIM_SPEED=1.5    faster swimming (the same while he swims)
 //   WWHD_MOD_RUN_MODE=0|1|2    running applies always, while L3 is held, or L3 switches it on and off
@@ -42,6 +44,9 @@ std::atomic<float> g_sens{env_f("WWHD_MOD_MOUSE_SENS", 0.15f)};
 std::atomic<bool> g_fp{env_on("WWHD_MOD_FIRST_PERSON")};
 std::atomic<bool> g_doors{env_on("WWHD_MOD_QUICK_DOORS")};
 std::atomic<bool> g_scenes{env_on("WWHD_MOD_FAST_SCENES")};
+std::atomic<bool> g_ff_cut{env_on("WWHD_MOD_FF_CUTSCENES")};
+std::atomic<bool> g_ff_talk{env_on("WWHD_MOD_FF_DIALOGUES")};
+std::atomic<bool> g_zr{false};
 std::atomic<float> g_run{env_f("WWHD_MOD_RUN_SPEED", 1.0f)};
 std::atomic<float> g_swim{env_f("WWHD_MOD_SWIM_SPEED", 1.0f)};
 // running [0] and swimming [1]: when they apply (0 always, 1 while L3 is held, 2 L3 switches), and
@@ -50,6 +55,7 @@ std::atomic<int> g_mode[2] = {{(int)env_f("WWHD_MOD_RUN_MODE", 0)}, {(int)env_f(
 std::atomic<bool> g_on[2] = {{false}, {false}};
 std::atomic<bool> g_swimming{false};  // Link's last procedure was a swimming one
 bool g_l3_was = false;
+std::atomic<bool> g_l_held{false};  // the moon jump cheat's button (cheats.cpp)
 
 void note(const char* what, bool on) { LOG("[mods] %s %s", what, on ? "on" : "off"); }
 }  // namespace
@@ -61,6 +67,11 @@ void set_camera_speed(float s) {
     g_speed = s;
     LOG("[mods] camera speed x%.2f", s);
 }
+// pinch zoom: applied where the camera is drawn (interp.cpp hook_024FFC40), never to the game's
+// own camera state, so the follow camera, collision and saves keep the game's distance
+static std::atomic<float> g_zoom{1.0f};
+float camera_zoom() { return g_zoom.load(std::memory_order_relaxed); }
+void set_camera_zoom(float z) { g_zoom = std::fmin(std::fmax(z, 0.5f), 2.0f); }
 bool mouse_camera() { return g_mouse.load(std::memory_order_relaxed); }
 void set_mouse_camera(bool on) {
     g_mouse = on;
@@ -76,6 +87,11 @@ bool first_person_wheel() { return g_fp.load(std::memory_order_relaxed); }
 void set_first_person_wheel(bool on) { g_fp = on; note("first person on R3 / mouse wheel", on); }
 bool quick_doors() { return g_doors.load(std::memory_order_relaxed); }
 void set_quick_doors(bool on) { g_doors = on; note("quick doors", on); }
+bool ff_cutscenes() { return g_ff_cut.load(std::memory_order_relaxed); }
+void set_ff_cutscenes(bool on) { g_ff_cut = on; note("fast forward of cutscenes (ZR)", on); }
+bool ff_dialogues() { return g_ff_talk.load(std::memory_order_relaxed); }
+void set_ff_dialogues(bool on) { g_ff_talk = on; note("fast forward of dialogues (ZR)", on); }
+bool ff_button() { return g_zr.load(std::memory_order_relaxed); }
 bool fast_scenes() { return g_scenes.load(std::memory_order_relaxed); }
 void set_fast_scenes(bool on) { g_scenes = on; note("fast scene changes", on); }
 float run_speed() { return g_run.load(std::memory_order_relaxed); }
@@ -109,8 +125,21 @@ void set_swim_mode(int m) { set_mode(1, m); }
 // L3 (left stick click) as the button of faster running and swimming, each with its own mode: held,
 // or each press switches it on and off. A press switches the one for what Link is doing: swimming
 // in the water, else running. The game itself sees L3 as usual.
+bool l_held() { return g_l_held.load(std::memory_order_relaxed); }
+std::atomic<float> g_lx{0}, g_ly{0};
+void stick_input(float x, float y) {
+    g_lx.store(x, std::memory_order_relaxed);
+    g_ly.store(y, std::memory_order_relaxed);
+}
+void left_stick(float& x, float& y) {
+    x = g_lx.load(std::memory_order_relaxed);
+    y = g_ly.load(std::memory_order_relaxed);
+}
+
 void run_input(uint32_t buttons) {
+    g_zr.store((buttons & input::kZR) != 0, std::memory_order_relaxed);  // fast forward (turbo.cpp)
     bool l3 = (buttons & input::kStickL) != 0;
+    g_l_held.store((buttons & input::kL) != 0, std::memory_order_relaxed);
     for (int w = 0; w < 2; w++)
         if (g_mode[w].load(std::memory_order_relaxed) == 1) g_on[w] = l3;
     int w = g_swimming.load(std::memory_order_relaxed) ? 1 : 0;

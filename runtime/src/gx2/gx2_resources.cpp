@@ -52,8 +52,11 @@ HLE(gx2, GX2SetColorBuffer) {
     set_reg(mmCB_COLOR0_SIZE + target, cb->reg_size);
     set_reg(mmCB_COLOR0_VIEW + target, cb->reg_view);
     set_reg(mmCB_COLOR0_INFO + target, cb->reg_info);
-    // our convention: the unused TILE/FRAG registers carry the view's real width (| array slices << 16) and height
-    uint32 slices = cb->surface.dim.value() == Latte::E_DIM::DIM_2D_ARRAY ? std::max<uint32>(cb->surface.depth, 1) : 1;
+    // our convention: the unused TILE/FRAG registers carry the view's real width (| array slices << 16) and height.
+    // 3D surfaces count their slices too: the game renders them slice by slice (the Picto Box's colour
+    // grading volumes), each slice a layer of the render target (vk_surfaces.cpp builds the 3D texture)
+    auto dim = cb->surface.dim.value();
+    uint32 slices = dim == Latte::E_DIM::DIM_2D_ARRAY || dim == Latte::E_DIM::DIM_3D ? std::max<uint32>(cb->surface.depth, 1) : 1;
     set_reg(mmCB_COLOR0_TILE + target, std::max<uint32>(cb->surface.width >> cb->viewMip, 1) | (slices << 16));
     set_reg(mmCB_COLOR0_FRAG + target, std::max<uint32>(cb->surface.height >> cb->viewMip, 1));
 }
@@ -152,7 +155,7 @@ HLE(gx2, GX2SetVertexShader) {
     }
     if (nsem) {
         set_reg(mmSQ_VTX_SEMANTIC_CLEAR, 0xFFFFFFFF);
-        set_regs(mmSQ_VTX_SEMANTIC_0, &tmp[mmSQ_VTX_SEMANTIC_0], nsem);
+        set_regs(mmSQ_VTX_SEMANTIC_0, &tmp[mmSQ_VTX_SEMANTIC_0], 32);  // the rest cleared (bind_vertex_shader_regs)
     }
 }
 
@@ -268,8 +271,8 @@ HLE(gx2, GX2InitFetchShaderEx) {
 
 HLE(gx2, GX2SetFetchShader) {
     uint32 fs = arg(c, 0);
-    set_reg(mmSQ_PGM_START_FS, ld32(fs + 0x0C) >> 8);
-    set_reg(mmSQ_PGM_START_FS + 1, ld32(fs + 0x08) >> 3);
+    uint32 v[2] = {ld32(fs + 0x0C) >> 8, ld32(fs + 0x08) >> 3};
+    set_regs(mmSQ_PGM_START_FS, v, 2);
 }
 
 // ---------------------------------------------------------------- uniforms and attribute buffers
@@ -285,7 +288,7 @@ static void uniform_regs(uint32 stageBase, uint32 offset, uint32 count, uint32 v
     if (offset & 0x8000) return;
     count &= ~3u;
     if (offset + count > 0x400) count = 0x400 - std::min<uint32>(offset, 0x400);
-    static thread_local uint32 tmp[0x400];  // per thread: several cores record display lists at once
+    uint32 tmp[0x400];  // on the stack: per thread (several cores record display lists at once), no TLS lookup
     for (uint32 i = 0; i < count; i++) tmp[i] = ld32(values + 4 * i);
     if (stageBase == 0x400 && count == 16 && aspect::tagged_projection()) {  // a layout projection (aspect.cpp)
         uint32 w[17];

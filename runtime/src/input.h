@@ -35,9 +35,11 @@ void rumble(const uint8_t* pattern, int bits);
 void rumble_hold(bool on);
 
 void init();       // main thread, after NSApplication exists
-PadState read();   // any thread
+PadState read(bool consume = true);
+void set_auto_buttons(uint32_t bits);  // buttons the runtime holds itself (a save state loaded from the title: savestate.cpp)   // any thread; consume = false leaves short taps for the next read
 void release_keys();                // forget held keys (another window took the keyboard)
 void controller_values(float* v);   // main thread: input_map::kPadCount host controller inputs, 0..1
+void host_controller_values(float* v);  // any thread: the latest controller_values (settings overlay)
 void held_keys(bool* keys);         // 256 entries: keys held for the game (keyboard + WWHD_KEYS script)
 
 // Ask the user for a line of text (software keyboard). Non-blocking: `done` runs on the
