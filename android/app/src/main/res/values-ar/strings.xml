@@ -9,11 +9,11 @@
     <string name="opt_off">معطل</string>
     <string name="opt_ok">حسناً</string>
     <string name="opt_cancel">إلغاء</string>
-    <string name="opt_tab_game">اللعبة</string>
-    <string name="opt_tab_graphics">الرسوميات</string>
-    <string name="opt_tab_controls">التحكم</string>
-    <string name="opt_tab_saves">الحفظ</string>
-    <string name="opt_tab_mods">المودات والتعريب</string>
+    <string name="opt_game">اللعبة</string>
+    <string name="opt_graphics">الرسوميات</string>
+    <string name="opt_controls">التحكم</string>
+    <string name="opt_saves">الحفظ</string>
+    <string name="opt_mods">المودات والتعريب</string>
 
     <!-- Language -->
     <string name="opt_language">لغة اللعبة</string>
@@ -90,13 +90,11 @@
     <!-- Graphics -->
     <string name="opt_light">الرسوميات</string>
     <string name="opt_light_hint">وضع خفيف: للأجهزة الضعيفة، بدون ظلال بعيدة أو انسداد محيطي</string>
-    <string name="opt_res_scale">دقة العرض</string>
-    <string name="opt_res_scale_hint">دقة التصيير ثلاثي الأبعاد</string>
+    <string name="opt_resolution">دقة العرض</string>
     <string name="opt_fps">معدل الإطارات (FPS)</string>
     <string name="opt_fps_hint">30 أو 60 إطاراً في الثانية</string>
 
     <!-- Restart Dialogs -->
     <string name="gpu_driver_later">لاحقاً</string>
     <string name="res_restart_now">إعادة التشغيل الآن</string>
-    <string name="button_style_restart">تتغير أشكال الأزرار بعد إعادة التشغيل.</string>
 </resources>
